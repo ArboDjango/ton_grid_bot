@@ -1,0 +1,20 @@
+[Unit]
+Description=Timer — Portfolio Manager toutes les 6 heures
+# Lié au .service du même nom
+Requires=portfolio_manager.service
+
+[Timer]
+# Déclenche 2 minutes après le démarrage du système (évite les conflits au boot)
+OnBootSec=2min
+
+# Puis toutes les 6 heures (à adapter : 30min, 6h, etc.)
+OnUnitActiveSec=6h
+
+# Si le timer a raté une échéance (machine éteinte), il rattrape au prochain boot
+Persistent=true
+
+# Randomise le déclenchement de ±2min pour éviter les pics de charge
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=Portfolio Manager — Réallocation Grid Bots
+# S'assure que les deux bots sont démarrés avant d'analyser
+After=bot_inj.service bot_egld.service
+# Ne bloque PAS si un bot est down (cas stop loss normal)
+Wants=bot_inj.service bot_egld.service
+
+[Service]
+Type=oneshot
+# ── À adapter selon ton environnement ────────────────────────────
+User=arbodjango
+WorkingDirectory=/home/arbodjango/ton_grid_bot
+
+# Environnement Python — adapter si tu utilises un venv
+# Avec venv :
+# ExecStart=/home/arbodjango/ton_grid_bot/python portfolio_manager.py
+# Sans venv :
+ExecStart=/usr/bin/python3 /home/arbodjango/ton_grid_bot/portfolio_manager.py
+
+# ── Comportement en cas d'erreur ─────────────────────────────────
+# oneshot : pas de restart automatique (le timer relancera au prochain cycle)
+Restart=no
+
+# ── Logs ─────────────────────────────────────────────────────────
+# Accessible via : journalctl -u portfolio_manager.service
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=portfolio_manager
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+# Logs
+*.log
+*.log.*
+
+# Etats trading
+bot_state.json
+bot_state.json.save
+
+# Historiques
+portfolio_history*.json
+portfolio_history*.jsonl
+portfolio_report.json
+reallocation_history.jsonl
+last_reallocation*.json
+
+# Snapshots
+snapshot_*.json
+
+# Cache
+__pycache__/
+*.pyc
+pin_cache.json
+window_weights_cache.json
+
+# Locks
+lock_*.pid
+
+# Flags
+*.flag
+
+# Virtualenv
+venv/
+
+# Sauvegardes
+*.bak
+*.disabled
