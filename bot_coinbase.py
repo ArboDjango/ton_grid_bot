@@ -16,9 +16,9 @@ import pandas as pd
 import numpy as np
 import ta
 from exchange_base import OrderResult
-from exchange_binance import ExchangeBinance
+from exchange_coinbase import ExchangeCoinbase
 
-exchange = ExchangeBinance()
+exchange = ExchangeCoinbase()
 
 try:
     import websocket
@@ -116,9 +116,9 @@ elif SYMBOL == "EGLDUSDC":
     DENSITY_K_MAX    = 1.00
 
 elif SYMBOL == "FILUSDC":
-    DENSITY_ATR_LOW  = 0.0041
-    DENSITY_ATR_HIGH = 0.0078
-    DENSITY_K_MIN    = 0.50
+    DENSITY_ATR_LOW  = 0.0031
+    DENSITY_ATR_HIGH = 0.0087
+    DENSITY_K_MIN    = 0.60
     DENSITY_K_MAX    = 1.00
 
 else:
@@ -155,7 +155,7 @@ GUL_HARD_MAX_PCT = 0.15
 GLL_HARD_MIN_PCT = 0.020
 GLL_HARD_MAX_PCT = 0.15
 
-TRADING_FEE_RT    = 0.00075
+TRADING_FEE_RT    = 0.006
 EQ16_MIN_RATIO    = 2.0
 EQ16_MAX_RETRIES  = 3
 
@@ -167,9 +167,9 @@ KLINE_LIMIT     = 50
 LOOP_SLEEP      = 0.2
 INDICATORS_FREQ = 60
 ADX_TREND_LIMIT = 50
-STATE_FILE      = f"state_{SYMBOL.lower()}.json"
-JOURNAL_FILE    = f"journal_{SYMBOL.lower()}.jsonl"
-SNAPSHOT_FILE   = "snapshot_t0.json"
+STATE_FILE = f"state_coinbase_{SYMBOL.lower()}.json"
+JOURNAL_FILE = f"journal_coinbase_{SYMBOL.lower()}.jsonl"
+SNAPSHOT_FILE   = "snapshot_t0_coinbase.json"
 SNAPSHOT_META_KEYS = {"date_reference", "timestamp_reference", "CASH"}
 FAILED_COOLDOWN_INITIAL = 3
 FAILED_COOLDOWN_MAX     = 60
@@ -546,13 +546,14 @@ if NB_BOTS is None:
         logger.error("❌ Échec de création du lock, arrêt.")
         sys.exit(1)
     NB_BOTS = get_snapshot_bot_count()
-    logger.info(f"🔍 Répartition cash T0 : {NB_BOTS} bot(s) d'après {SNAPSHOT_FILE}")
+    logger.info(f"🤖 {NB_BOTS} bot(s) actif(s) détecté(s) (fichiers lock)")
 else:
     create_lock(SYMBOL)
     logger.info(f"🤖 Partage forcé : {NB_BOTS} bot(s) (argument --bots)")
 
 
 _shutdown_requested = False
+
 def _handle_signal(sig, frame):
     global _shutdown_requested
     _shutdown_requested = True
@@ -666,6 +667,9 @@ def _snapshot_capital_usdc(state: dict, price: float) -> float | None:
     try:
         with open(SNAPSHOT_FILE, "r") as f:
             snap = json.load(f)
+            
+        logger.info(f"📂 Snapshot chargé : {SNAPSHOT_FILE}")
+        
         tokens = [k for k in snap if k not in SNAPSHOT_META_KEYS]
         if BASE_ASSET not in snap or not tokens:
             return None
@@ -691,28 +695,51 @@ def _snapshot_capital_usdc(state: dict, price: float) -> float | None:
             state["total_base_qty"] = base_qty
             logger.info(f"📦 Inventaire initialisé depuis {SNAPSHOT_FILE} : {base_qty:.6f} {BASE_ASSET}")
 
-        return base_qty * ref_price + cash_share
+        capital = base_qty * ref_price + cash_share
+
+        logger.info(
+            f"💰 Capital calculé depuis le snapshot : "
+            f"{capital:.2f} USDC "
+            f"(Stock={base_qty:.6f} {BASE_ASSET}, "
+            f"Prix={ref_price:.3f}, "
+            f"Cash={cash_share:.2f})"
+        )
+
+        return capital
+        
     except Exception as e:
         logger.warning(f"⚠️ Lecture {SNAPSHOT_FILE} impossible pour capital_usdc : {e}")
         return None
 
 def ensure_capital_usdc(state: dict, price: float, quote_bal_real: float, base_bal_real: float) -> float:
+    
     capital_usdc = _num(state.get("capital_usdc"))
+    
+    if MAX_BUDGET_USDC is not None and MAX_BUDGET_USDC > 0:
+
+        if abs(capital_usdc - MAX_BUDGET_USDC) > 1e-8:
+            state["capital_usdc"] = MAX_BUDGET_USDC
+            logger.info(
+                f"💰 capital_usdc initialisé depuis --budget : {MAX_BUDGET_USDC:.2f} {QUOTE_ASSET}"
+            )
+
+        return MAX_BUDGET_USDC
+    
+
+    
     if capital_usdc > 0:
         return capital_usdc
 
     snapshot_capital = _snapshot_capital_usdc(state, price)
+    
     if snapshot_capital and snapshot_capital > 0:
         state["capital_usdc"] = snapshot_capital
         logger.info(f"💰 capital_usdc initialisé depuis {SNAPSHOT_FILE} : {snapshot_capital:.2f} {QUOTE_ASSET}")
         return snapshot_capital
 
-    if MAX_BUDGET_USDC is not None and MAX_BUDGET_USDC > 0:
-        state["capital_usdc"] = MAX_BUDGET_USDC
-        logger.info(f"💰 capital_usdc initialisé depuis --budget : {MAX_BUDGET_USDC:.2f} {QUOTE_ASSET}")
-        return MAX_BUDGET_USDC
 
     inventory_cost = _inventory_cost(state)
+    
     if inventory_cost <= 0 and base_bal_real > 0 and price > 0:
         inventory_cost = base_bal_real * price
     fallback_capital = max(0.0, inventory_cost + quote_bal_real)
@@ -938,7 +965,7 @@ def reconcile_inventory(state: dict, price: float):
         logger.info("✅ Inventaire cohérent (écart < 1e-8)")
         return
 
-    logger.warning(f"⚠️ Écart d'inventaire détecté : local={local_qty:.6f}, Binance={real_base_bal:.6f}, diff={diff:+.6f}")
+    logger.warning(f"⚠️ Écart d'inventaire détecté : local={local_qty:.6f}, {exchange.NAME}={real_base_bal:.6f}, diff={diff:+.6f}")
     if diff > 0:
         buy_price = state.get("P0", price)
         if buy_price is None:
@@ -991,16 +1018,34 @@ def remove_from_inventory_fifo(state: dict, qty: float):
 def reconcile_open_orders(state: dict):
     try:
         open_orders = exchange.get_open_orders(SYMBOL)
+        
         if not open_orders:
-            logger.info("✅ Aucun ordre ouvert trouvé sur Binance.")
+            logger.warning(
+                f"⚠️ Aucun ordre ouvert trouvé sur {exchange.NAME}."
+            )
+
+            if state.get("grid_ready", False):
+                logger.warning(
+                    "⚠️ Le state indique une grille active mais l'exchange n'a aucun ordre."
+                )
+                logger.warning(
+                    "🔄 Réinitialisation de la grille demandée."
+                )
+
+                state["grid_ready"] = False
+                state["buy_grid"] = []
+                state["sell_grid"] = []
+
+                save_state(state)
+
             return
 
-        logger.info(f"🔍 {len(open_orders)} ordre(s) ouvert(s) détecté(s) sur Binance.")
+        logger.info(f"🔍 {len(open_orders)} ordre(s) ouvert(s) détecté(s) sur {exchange.NAME}.")
         for order in open_orders:
-            order_id     = order["order_id"]
+            order_id     = order["orderId"]
             side         = order["side"]
-            orig_qty     = order["orig_qty"]
-            executed_qty = order["executed_qty"]
+            orig_qty     = order["origQty"]
+            executed_qty = order["executedQty"]
             price        = order["price"]
             status       = order["status"]
             if status in ("NEW", "PARTIALLY_FILLED"):
@@ -1507,6 +1552,7 @@ last_exposure_state = None
 
 while not _shutdown_requested:
     try:
+               
         if failed_consecutive > 0:
             backoff = min(
                 FAILED_COOLDOWN_INITIAL * (2 ** (failed_consecutive - 1)),
@@ -1525,11 +1571,6 @@ while not _shutdown_requested:
             if ws_running and ws_price is not None and age > WS_FORCE_RESTART_AGE:
                 logger.warning(f"⚠️ Prix WS périmé depuis {age:.1f}s > {WS_FORCE_RESTART_AGE}s — redémarrage WebSocket forcé")
                 stop_price_websocket()
-                with _ws_retry_lock:
-                    ws_retry_count += 1
-                start_price_websocket(SYMBOL)
-            elif not ws_running:
-                logger.warning("⚠️ WebSocket inactif, tentative de redémarrage...")
                 with _ws_retry_lock:
                     ws_retry_count += 1
                 start_price_websocket(SYMBOL)

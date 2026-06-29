@@ -8,23 +8,14 @@ import sys
 import numpy as np
 import pandas as pd
 import ta
-from binance.client import Client
-from dotenv import load_dotenv
-import os
+from exchange_base import ExchangeBase
 
-load_dotenv()
-
-client = Client(
-    os.getenv("BINANCE_API_KEY"),
-    os.getenv("BINANCE_API_SECRET")
-)
-
-def calibrate(symbol: str, limit: int = 500) -> dict:
+def calibrate(exchange: ExchangeBase, symbol: str, limit: int = 500) -> dict:
     """
-    Calibre les paramètres de grille pour un symbole donné.
+    Calibre les paramètres de grille pour un symbole donné independament de l'echangeur.
     
     Args:
-        symbol: Paire Binance (ex: "INJUSDC")
+        symbol: Paire de trading (ex: "INJUSDC")
         limit: Nombre de klines 15min à récupérer (défaut 500)
     
     Returns:
@@ -39,17 +30,7 @@ def calibrate(symbol: str, limit: int = 500) -> dict:
         }
     """
     # Téléchargement des klines 15min
-    klines = client.get_klines(
-        symbol=symbol,
-        interval=Client.KLINE_INTERVAL_15MINUTE,
-        limit=limit
-    )
-    df = pd.DataFrame(klines, columns=[
-        'time','open','high','low','close','volume',
-        'ct','qav','trades','tbb','tbq','i'
-    ])
-    for col in ['high','low','close']:
-        df[col] = df[col].astype(float)
+    df = exchange.get_klines(symbol, exchange.KLINE_15M, limit)
     
     # Calcul ATR normalisé
     atr_series = ta.volatility.average_true_range(
@@ -96,11 +77,13 @@ def calibrate(symbol: str, limit: int = 500) -> dict:
 # Partie main : si le script est exécuté directement
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    from exchange_gateio import ExchangeGateIO
     if len(sys.argv) < 2:
         print("Usage: python calibrate_atr.py SYMBOLE")
         sys.exit(1)
+    exchange = ExchangeBinance()
     symbol = sys.argv[1].upper()
-    params = calibrate(symbol)
+    params = calibrate(exchange, symbol)
     
     print(f"\n{'='*60}")
     print(f"  CALIBRATION ATR — {symbol}")

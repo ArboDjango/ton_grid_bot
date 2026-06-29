@@ -49,6 +49,7 @@ _INTERVAL_TO_GRANULARITY: dict[str, str] = {
 
 
 class ExchangeCoinbase(ExchangeBase):
+    NAME = "Coinbase"
     """
     Implémentation Coinbase Advanced Trade de ExchangeBase.
 

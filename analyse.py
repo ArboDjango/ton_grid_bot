@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AUDIT BOT GRID - V8
+AUDIT BOT GRID - V10b
 Analyse complète du patrimoine vs stratégie Hold.
 PnL Binance incrémental via curseur last_trade_id -> ne relit jamais les vieux trades.
 
@@ -11,6 +11,16 @@ Améliorations V8 :
   - Ajout de total_base_qty dans les exports
   - alpha_pct conservé mais basé sur capital_usdc (définition bot)
   - Nettoyage des imports inutiles
+
+Améliorations V10b :
+  - Export explicite de pnl_bot (= state["total_pnl"]) dans le JSONL sous le
+    nom "pnl_bot", à distinguer de "pnl_real" (PnL Binance cash net).
+    Propriétés de pnl_bot :
+      * Toujours >= 0 quand la grille fonctionne (somme des profits round-trips)
+      * Indépendant des achats d'inventaire et du sens du marché
+      * Mesure exactement l'edge de market-making du bot
+    Le portfolio_manager score sur delta_pnl_bot (= pnl_bot_end - pnl_bot_start)
+    plutôt que sur delta_pnl (pnl_real), plus bruité et directionnel.
 """
 import os
 import sys
@@ -68,6 +78,32 @@ def pct(val: float, ref: float) -> str:
         return "n/a"
     return f"{fmt_signed(val / ref * 100, 2)}%"
 
+def _cash_usdc(snap_cash: dict) -> float:
+    """
+    Lit le montant USDC dans snap['CASH'] de façon tolérante à la casse.
+    bot_V101c.py écrit/lit la clé en majuscules ('USDC'), comme dans
+    snapshot_t0.json actuel ({"CASH": {"USDC": 339}}). On accepte aussi
+    'usdc' / 'Usdc' pour rester compatible avec d'anciens snapshots.
+    """
+    if not isinstance(snap_cash, dict):
+        return 0.0
+    for key in ("USDC", "usdc", "Usdc"):
+        if key in snap_cash:
+            return float(snap_cash[key])
+    return 0.0
+
+def _date_reference(snap: dict) -> str:
+    """
+    Renvoie un libellé de date de référence pour l'affichage/export.
+    bot_V101c.py n'écrit que 'timestamp_reference' (pas 'date_reference'),
+    donc on retombe sur ce champ si 'date_reference' est absent.
+    """
+    if "date_reference" in snap:
+        return snap["date_reference"]
+    if "timestamp_reference" in snap:
+        return snap["timestamp_reference"]
+    return "inconnue"
+
 # ─────────────────────────────────────────────
 # SNAPSHOT — avec validation
 # ─────────────────────────────────────────────
@@ -95,8 +131,13 @@ def get_snapshot() -> dict:
         raise ValueError(
             f"snapshot_t0.json incomplet — clés manquantes : {', '.join(missing)}"
         )
-    if "usdc" not in snap["CASH"]:
-        raise ValueError("snapshot_t0.json : clé 'usdc' manquante dans CASH")
+    # FIX : la clé CASH est en majuscules dans le snapshot réel ("USDC"),
+    # on valide donc via le helper tolérant à la casse au lieu de chercher
+    # littéralement "usdc".
+    if _cash_usdc(snap.get("CASH", {})) == 0.0 and not any(
+        k in snap.get("CASH", {}) for k in ("USDC", "usdc", "Usdc")
+    ):
+        raise ValueError("snapshot_t0.json : clé 'USDC' (ou 'usdc') manquante dans CASH")
 
     # Détection automatique des tokens
     token_names = [k for k in snap if k not in SNAPSHOT_META_KEYS]
@@ -288,7 +329,32 @@ def run_audit(client: Client, snapshot: dict) -> dict:
         alpha_pair = pnl_reel + delta_tokens_value
 
         state = load_bot_state(cfg["symbol"])
+
+        # Valeur réelle du portefeuille du bot
         capital_usdc = state.get("capital_usdc", 0.0)
+
+        # Budget attribué par portfolio_manager
+        budget_usdc = state.get(
+            "budget_usdc",
+            capital_usdc
+        )
+
+        wallet_peak = state.get("wallet_peak", capital_usdc)
+
+        # V10b : capital_usdc représente déjà le capital virtuel du bot.
+        # Ne pas ajouter la valeur de l'inventaire, sinon on le compte deux fois.
+        pnl_bot = state.get("total_pnl", 0.0)
+        total_wallet = (
+            capital_usdc
+            + state.get("total_pnl", 0.0)
+        )
+
+        drawdown_pct = (
+            max(0.0, 1.0 - total_wallet / wallet_peak)
+            if wallet_peak > 0
+            else 0.0
+        )
+
         alpha_pct = (alpha_pair / capital_usdc) if capital_usdc > 0 else 0.0
 
         ema_buy = state.get("ema_slippage_buy", 0.0)
@@ -328,7 +394,12 @@ def run_audit(client: Client, snapshot: dict) -> dict:
             "delta_tokens_value": delta_tokens_value,
             "alpha_pair": alpha_pair,
             "capital_usdc": capital_usdc,
+            "budget_usdc": budget_usdc,
+            "pnl_bot": pnl_bot,
             "alpha_pct": alpha_pct,
+            "wallet_peak": wallet_peak,
+            "total_wallet": total_wallet,
+            "drawdown_pct": drawdown_pct,
             "efficiency": (alpha_pair / nb_trades) if nb_trades > 0 else 0.0,
             "ema_slip": ema_slip,
             "ema_slippage_buy": ema_buy,
@@ -471,6 +542,11 @@ def export_metrics_json(r, filename="audit_metrics.json"):
             "pnl_real":          d["pnl_reel"],
             "delta_token_value": d["delta_tokens_value"],
             "capital_usdc":      d["capital_usdc"],
+            "budget_usdc":       d["budget_usdc"],
+            "pnl_bot":           d["pnl_bot"],
+            "wallet_peak":      d["wallet_peak"],
+            "total_wallet":     d["total_wallet"],
+            "drawdown_pct":     d["drawdown_pct"],
             "trades":            d["nb_trades"],
             "price":             d["prix"],
             "ema_slip":          d["ema_slip"],
@@ -486,13 +562,40 @@ def export_metrics_json(r, filename="audit_metrics.json"):
         json.dump(out, f, indent=2)
 
     # Historisation Portfolio Manager (JSONL)
+    # Contrat de champs avec portfolio_manager :
+    #   pnl_bot  = state["total_pnl"] = somme cumulée des profits round-trips (>= 0)
+    #   pnl_real = usdc_gained - usdc_spent  (bruité, directionnel, peut être < 0)
+    # Le scorer utilise delta_pnl_bot ; pnl_real est conservé pour la vérification.
+    # alpha_pair est conservé comme fallback pour les lignes historiques sans pnl_bot.
     history_file = "portfolio_history.jsonl"
     with open(history_file, "a") as f:
         for pair, d in out["pairs"].items():
             row = {
-                "timestamp": out["timestamp"],
-                "pair": pair,
-                **d
+                "timestamp":         out["timestamp"],
+                "pair":              pair,
+                # ── scoring (portfolio_manager) ─────────────────────────
+                "pnl_bot":           d["pnl_bot"],           # state["total_pnl"] — toujours >= 0
+                "alpha_pair":        d["alpha_pair"],         # fallback pour lignes sans pnl_bot
+                "alpha_pct":         d["alpha_pct"],
+                "pnl_real":          d["pnl_real"],           # display / vérification uniquement
+                "delta_token_value": d["delta_token_value"],
+                # ── capital et drawdown ──────────────────────────────────
+                "capital_usdc":      d["capital_usdc"],
+                "budget_usdc":       d["budget_usdc"],
+                "wallet_peak":       d["wallet_peak"],
+                "total_wallet":      d["total_wallet"],
+                "drawdown_pct":      d["drawdown_pct"],
+                # ── activité ────────────────────────────────────────────
+                "trades":            d["trades"],
+                # ── infos grille ────────────────────────────────────────
+                "price":             d["price"],
+                "ema_slip":          d["ema_slip"],
+                "gv":                d["gv"],
+                "density_k":         d["density_k"],
+                "nb_levels":         d["nb_levels"],
+                "f0_estime":         d["f0_estime"],
+                "f0_recommande":     d["f0_recommande"],
+                "total_base_qty":    d["total_base_qty"],
             }
             f.write(json.dumps(row) + "\n")
 
