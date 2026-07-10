@@ -1,4 +1,4 @@
-BOT_VERSION = "V107"
+BOT_VERSION = "V106"
 
 import os
 import sys
@@ -15,17 +15,10 @@ import bisect
 import pandas as pd
 import numpy as np
 import ta
-
-import inventory_manager as inv_mgr
-
 from exchange_base import OrderResult
 from exchange_gateio import ExchangeGateIO
 
 from inventory_utils import verify_and_resync_inventory_cost
-
-# ========== RN-011 : import du contrôleur de capital cible ==========
-from capital_target import CapitalTargetController
-
 
 exchange = ExchangeGateIO()
 
@@ -213,9 +206,6 @@ ws_retry_count  = 0
 _ws_retry_lock  = threading.Lock()
 WS_BACKOFF_BASE = 1.0
 WS_BACKOFF_MAX  = 60.0
-
-_ws_reconnect_timer = None          # threading.Timer de reconnexion en attente
-_ws_reconnect_lock  = threading.Lock()
 
 failed_consecutive = 0
 _capital_initial = None
@@ -564,6 +554,11 @@ def start_price_websocket(symbol: str):
             ws_retry_count = 0
         return
 
+    delay = min(WS_BACKOFF_BASE * (2 ** ws_retry_count), WS_BACKOFF_MAX)
+    if ws_retry_count > 0:
+        logger.info(f"⏳ Backoff WebSocket : attente {delay:.1f}s avant tentative {ws_retry_count+1}")
+        time.sleep(delay)
+
     ws_url = exchange.get_ws_stream_url(symbol)
     logger.info(f"🔌 Connexion à {ws_url} (tentative {ws_retry_count+1})")
 
@@ -577,27 +572,17 @@ def start_price_websocket(symbol: str):
 
     def on_error(ws, error):
         logger.error(f"Erreur WebSocket : {error}")
-        try:
-            ws.close()
-        except Exception:
-            pass
 
     def on_close(ws, close_status_code, close_msg):
         global ws_running
-        if not ws_running:
-            return
         ws_running = False
         logger.warning("WebSocket fermé")
-        _schedule_ws_reconnect(symbol)
 
     def on_open(ws):
         global ws_running, ws_retry_count
         ws_running = True
         with _ws_retry_lock:
             ws_retry_count = 0
-        
-        ws.send(json.dumps(exchange.get_ws_subscribe_message(symbol)))
-        
         logger.info(f"🌐 WebSocket connecté pour {symbol} (stream @trade)")
 
     ws_app = websocket.WebSocketApp(ws_url,
@@ -606,31 +591,12 @@ def start_price_websocket(symbol: str):
                                     on_error=on_error,
                                     on_close=on_close)
     def run_ws():
-        global ws_running
-
-        try:
-            ws_app.run_forever(
-                ping_interval=20,
-                ping_timeout=10,
-            )
-
-        finally:
-            logger.warning("⚠️ Thread WebSocket terminé")
-
-            ws_running = False
-
-            if not _shutdown_requested:
-                _schedule_ws_reconnect(symbol)
-                
+        ws_app.run_forever()
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
 
 def stop_price_websocket():
-    global ws_running, ws_app, _ws_reconnect_timer
-    with _ws_reconnect_lock:
-        if _ws_reconnect_timer is not None:
-            _ws_reconnect_timer.cancel()
-            _ws_reconnect_timer = None
+    global ws_running, ws_app
     if ws_running and ws_app:
         try:
             ws_app.close()
@@ -638,32 +604,6 @@ def stop_price_websocket():
             logger.error(f"Erreur fermeture WS : {e}")
     ws_running = False
     logger.info("🛑 WebSocket arrêté")
-
-
-def _schedule_ws_reconnect(symbol: str):
-    global _ws_reconnect_timer, ws_retry_count
-    if _shutdown_requested:
-        return
-    with _ws_reconnect_lock:
-        if _ws_reconnect_timer is not None:
-            _ws_reconnect_timer.cancel()
-        with _ws_retry_lock:
-            ws_retry_count += 1
-            retry_n = ws_retry_count
-        delay = min(WS_BACKOFF_BASE * (2 ** (retry_n - 1)), WS_BACKOFF_MAX)
-        logger.info(f"⏳ Backoff WebSocket : attente {delay:.1f}s avant tentative {retry_n}")
-        t = threading.Timer(delay, _ws_do_reconnect, args=(symbol,))
-        t.daemon = True
-        t.start()
-        _ws_reconnect_timer = t
-
-
-def _ws_do_reconnect(symbol: str):
-    global _ws_reconnect_timer
-    with _ws_reconnect_lock:
-        _ws_reconnect_timer = None
-    if not _shutdown_requested and not ws_running:
-        start_price_websocket(symbol)
 
 def get_ws_price() -> float | None:
     with ws_price_lock:
@@ -674,11 +614,7 @@ def get_ws_price() -> float | None:
             if not hasattr(get_ws_price, "_last_warn_time") or time.time() - get_ws_price._last_warn_time > 60:
                 get_ws_price._last_warn_time = time.time()
                 logger.warning(f"⚠️ Prix WS périmé ({age:.1f}s > {WS_PRICE_MAX_AGE}s) — fallback REST")
-        try:
-            return get_instant_price()
-        except Exception as e:
-            logger.warning(f"⚠️ Fallback REST échoué ({type(e).__name__}) : {e}")
-            return None
+        return get_instant_price()
     return p
 
 
@@ -688,7 +624,17 @@ def _num(value, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def _inventory_cost(state: dict) -> float:
+    total = 0.0
+    for lot in state.get("inventory_lots", []):
+        total += _num(lot.get("qty")) * _num(lot.get("buy_price"))
+    return total
+
 def _get_capital_from_snapshot(token: str) -> float | None:
+    """
+    Lit le capital du token dans le snapshot.
+    Retourne None si absent ou en cas d'erreur.
+    """
     if not os.path.exists(SNAPSHOT_FILE):
         return None
     try:
@@ -706,22 +652,38 @@ def _get_capital_from_snapshot(token: str) -> float | None:
 # NOUVELLE VERSION IDEMPOTENTE DE ensure_capital_usdc
 # ═══════════════════════════════════════════════════════════════
 def ensure_capital_usdc(state: dict, price: float, quote_bal_real: float, base_bal_real: float) -> float:
+    """
+    Retourne le capital_usdc du bot de manière idempotente.
+    - Si state["capital_usdc"] > 0, retourne immédiatement.
+    - Sinon, détermine la valeur (--budget > snapshot > fallback),
+      l'assigne à state["capital_usdc"], sauvegarde state une fois,
+      et retourne la valeur.
+    Aucun log n'est émis ici (les logs de capital initial sont gérés par get_balances).
+    """
+    
+    # 1. Priorité absolue : budget fourni au lancement
     if MAX_BUDGET_USDC is not None and MAX_BUDGET_USDC > 0:
         if abs(state.get("capital_usdc", 0.0) - MAX_BUDGET_USDC) > 1e-8:
             state["capital_usdc"] = MAX_BUDGET_USDC
             save_state(state)
         return MAX_BUDGET_USDC
     
+    
+    # Déjà initialisé → retour rapide
     if state.get("capital_usdc", 0.0) > 0:
         return state["capital_usdc"]
 
+
+
+    # 2. Snapshot (source de vérité)
     capital = _get_capital_from_snapshot(BASE_ASSET)
     if capital is not None and capital > 0:
         state["capital_usdc"] = capital
         save_state(state)
         return capital
 
-    inventory_cost = inv_mgr.inventory_cost(state)
+    # 3. Fallback rétrocompatible
+    inventory_cost = _inventory_cost(state)
     if inventory_cost <= 0 and base_bal_real > 0 and price > 0:
         inventory_cost = base_bal_real * price
     fallback = max(0.0, inventory_cost + quote_bal_real)
@@ -739,15 +701,16 @@ def compute_capital_view(state: dict, price: float,
         )
 
     capital_usdc = ensure_capital_usdc(state, price, quote_bal_real, base_bal_real)
-    
-    inventory_qty = inv_mgr.inventory_qty(state)
-    inventory_cost = inv_mgr.inventory_cost(state)
-    
+    inventory_qty = _num(state.get("total_base_qty"))
+    if inventory_qty <= 0:
+        inventory_qty = sum(_num(lot.get("qty")) for lot in state.get("inventory_lots", []))
+
+    inventory_cost = _inventory_cost(state)
     if inventory_qty > 0 and inventory_cost <= 0:
         inventory_cost = inventory_qty * (_num(state.get("P0")) or price)
 
-    inventory_value = inv_mgr.inventory_value(state, price)
-    unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price)
+    inventory_value = inventory_qty * price
+    unrealized_pnl = inventory_value - inventory_cost
     total_pnl = _num(state.get("total_pnl"))
     total_wallet = capital_usdc + total_pnl + unrealized_pnl
     capital_for_grid = max(0.0, min(total_wallet, capital_usdc))
@@ -878,7 +841,7 @@ def load_state() -> dict:
         "wallet_peak": 0.0, "total_trades": 0, "failed_count": 0,
         "total_slippage": 0.0, "cycle_recalc": 0,
         "ema_slippage_buy": 0.0, "ema_slippage_sell": 0.0,
-        "capital_usdc": 0.0,
+        "capital_usdc": 0.0,  # sera écrasé par le snapshot au démarrage
         "total_pnl": 0.0,
         "density_k": 0.65,
         "last_rebuild_price": 0.0,
@@ -943,32 +906,65 @@ def save_state(state: dict):
 
 def reconcile_inventory(state: dict, price: float):
     exchange.invalidate_balance_cache()
-
-    _, real_base_bal = exchange.get_balances(
+    __, real_base_bal = exchange.get_balances(
         QUOTE_ASSET,
         BASE_ASSET,
     )
+    local_qty = state.get("total_base_qty", 0.0)
+    diff = real_base_bal - local_qty
+    if abs(diff) < 1e-8:
+        logger.info("✅ Inventaire cohérent (écart < 1e-8)")
+        return
 
-    acquisition_price = state.get("P0") or price
-
-    changed = inv_mgr.reconcile(
-        state,
-        real_balance=real_base_bal,
-        acquisition_price=acquisition_price,
-        source="exchange_reconcile",
-    )
-
-    if changed:
-        state["total_base_qty"] = inv_mgr.inventory_qty(state)
-
-        logger.info(
-            f"✅ Inventaire réconcilié : "
-            f"{state['total_base_qty']:.6f}"
-        )
-
-        save_state(state)
+    logger.warning(f"⚠️ Écart d'inventaire détecté : local={local_qty:.6f}, {exchange.NAME}={real_base_bal:.6f}, diff={diff:+.6f}")
+    if diff > 0:
+        buy_price = state.get("P0", price)
+        if buy_price is None:
+            buy_price = price
+            logger.warning("⚠️ P0 non disponible, prix marché utilisé pour lot réconcilié")
+        state["inventory_lots"].append({
+            "qty": diff,
+            "buy_price": buy_price,
+            "timestamp": time.time(),
+            "reconciled": True
+        })
+        logger.info(f"➕ Ajout d'un lot réconcilié de {diff:.6f} à {buy_price:.4f}")
     else:
-        logger.info("✅ Inventaire cohérent")
+        to_remove = -diff
+        new_lots = []
+        for lot in state["inventory_lots"]:
+            if to_remove <= 0:
+                new_lots.append(lot)
+                continue
+            if lot["qty"] <= to_remove:
+                to_remove -= lot["qty"]
+                logger.info(f"🗑️ Suppression lot de {lot['qty']:.6f} à {lot['buy_price']:.4f} (réconciliation)")
+            else:
+                lot["qty"] -= to_remove
+                logger.info(f"✂️ Réduction lot de {to_remove:.6f} à {lot['buy_price']:.4f} (réconciliation)")
+                new_lots.append(lot)
+                to_remove = 0
+        state["inventory_lots"] = new_lots
+    state["total_base_qty"] = sum(lot["qty"] for lot in state["inventory_lots"])
+    logger.info(f"✅ Inventaire réconcilié : nouveau total={state['total_base_qty']:.6f}")
+    save_state(state)
+
+def remove_from_inventory_fifo(state: dict, qty: float):
+    remaining = qty
+    new_lots = []
+    for lot in state.get("inventory_lots", []):
+        if remaining <= 0:
+            new_lots.append(lot)
+            continue
+        if lot["qty"] <= remaining:
+            remaining -= lot["qty"]
+        else:
+            lot["qty"] -= remaining
+            new_lots.append(lot)
+            remaining = 0
+    state["inventory_lots"] = new_lots
+    state["total_base_qty"] = sum(lot["qty"] for lot in state["inventory_lots"])
+    logger.info(f"📉 Retrait FIFO de {qty:.6f} tokens, nouveau stock = {state['total_base_qty']:.6f}")
 
 def reconcile_open_orders(state: dict):
     try:
@@ -1007,16 +1003,16 @@ def reconcile_open_orders(state: dict):
                 if executed_qty > 0:
                     if side == "BUY":
                         logger.warning(f"⚠️ Ordre BUY {order_id} partiellement exécuté ({executed_qty} sur {orig_qty}) — ajout inventaire")
-                        inv_mgr.add_buy_lot(
-                            state,
-                            qty=executed_qty,
-                            buy_price=price,
-                            source="open_order_reconcile",
-                            reconciled=True,
-                        )
+                        state["inventory_lots"].append({
+                            "qty": executed_qty,
+                            "buy_price": price,
+                            "timestamp": time.time(),
+                            "reconciled": True
+                        })
+                        state["total_base_qty"] = state.get("total_base_qty", 0.0) + executed_qty
                     else:
                         logger.warning(f"⚠️ Ordre SELL {order_id} partiellement exécuté ({executed_qty} sur {orig_qty}) — retrait inventaire")
-                        inv_mgr.consume_fifo(state, executed_qty)
+                        remove_from_inventory_fifo(state, executed_qty)
                 try:
                     exchange.cancel_order(SYMBOL, order_id)
                     logger.info(f"🗑️ Ordre {order_id} annulé.")
@@ -1237,14 +1233,7 @@ def rate_limited_get_order(symbol: str, order_id: int) -> OrderResult:
 
 def execute_market_fallback(side, qty_asset, target_price, state, operational_reason) -> tuple[float | None, float]:
     try:
-        
-        result = exchange.create_market_order(
-            SYMBOL,
-            side,
-            qty_asset,
-            reference_price=target_price,
-        )
-        
+        result = exchange.create_market_order(SYMBOL, side, qty_asset)
         if result.is_filled:
             actual_price = result.avg_price if result.avg_price > 0 else target_price
             filled_qty   = result.executed_qty
@@ -1360,6 +1349,7 @@ def smart_execute_order(side, qty_usdc, target_price, state, current_stress, mac
 
         if remaining_qty > 0:
 
+            # Vérification préalable : le reliquat est-il négociable ?
             remaining_notional = remaining_qty * target_price
 
             if MIN_NOTIONAL > 0 and remaining_notional < MIN_NOTIONAL:
@@ -1397,16 +1387,6 @@ def smart_execute_order(side, qty_usdc, target_price, state, current_stress, mac
                     return limit_avg_price, limit_filled_qty
                 else:
                     return None, 0.0
-            
-            if limit_filled_qty > 0:
-                total_qty = limit_filled_qty + market_filled_qty
-                avg_price = (
-                    limit_avg_price * limit_filled_qty
-                    + market_price * market_filled_qty
-                ) / total_qty
-                return avg_price, total_qty
-            else:
-                return market_price, market_filled_qty
 
         else:
             return limit_avg_price, limit_filled_qty
@@ -1487,10 +1467,6 @@ get_symbol_precisions()
 state = load_state()
 journal = TradeJournal(SYMBOL)
 
-# ========== RN-011 : initialisation du contrôleur de capital cible ==========
-capital_target_controller = CapitalTargetController(SYMBOL, state_dir=".")
-logger.info("📦 CapitalTargetController initialisé pour convergence dynamique")
-
 # ── Calibration initiale ──────────────────────────────────────
 if _CALIBRATE_AVAILABLE and not state.get("grid_ready"):
     try:
@@ -1560,18 +1536,12 @@ while not _shutdown_requested:
             last_ws_check = time.time()
             with ws_price_lock:
                 age = time.time() - ws_price_time
-
-            if not ws_running:
-                with _ws_reconnect_lock:
-                    reconnect_pending = _ws_reconnect_timer is not None
-                if not reconnect_pending:
-                    logger.warning("⚠️ WS fermé sans reconnexion planifiée — déclenchement forcé")
-                    _schedule_ws_reconnect(SYMBOL)
-            elif ws_price is not None and age > WS_FORCE_RESTART_AGE:
+            if ws_running and ws_price is not None and age > WS_FORCE_RESTART_AGE:
                 logger.warning(f"⚠️ Prix WS périmé depuis {age:.1f}s > {WS_FORCE_RESTART_AGE}s — redémarrage WebSocket forcé")
-                with _ws_retry_lock:
-                    ws_retry_count = 0
                 stop_price_websocket()
+                with _ws_retry_lock:
+                    ws_retry_count += 1
+                start_price_websocket(SYMBOL)
 
         if time.time() - last_lock_update >= 30:
             update_lock(SYMBOL)
@@ -1692,10 +1662,6 @@ while not _shutdown_requested:
             )
             last_exposure_state = current_exposure_state
 
-        # ========== RN-011 : mise à jour du ratio de capital cible ==========
-        capital_target_controller.update(capital_for_grid)
-        capital_ratio = capital_target_controller.get_ratio()
-
         out_of_bounds = state["grid_ready"] and (price < state["Gll"] or price > state["Gul"])
         grid_empty    = state["grid_ready"] and (len(state["sell_grid"])==0 and len(state["buy_grid"])==0)
         must_init = not state["grid_ready"] or out_of_bounds or grid_empty
@@ -1736,8 +1702,7 @@ while not _shutdown_requested:
 
         # ── TRAITEMENT BUY ──────────────────────────────────────
         while len(buy_grid) > 0 and price <= buy_grid[0]:
-            # ========== RN-011 : injection du ratio dans le capital effectif ==========
-            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
+            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO
             capital_effectif *= buy_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
                                   state["nu"], state["nl"], state["density_k"])
@@ -1746,13 +1711,12 @@ while not _shutdown_requested:
                 touched = buy_grid.pop(0)
                 actual_buy_price, filled_qty = smart_execute_order(exchange.SIDE_BUY, Gv_local, price, state, stress, macro_data)
                 if actual_buy_price is not None and filled_qty > 0:
-                    
-                    inv_mgr.add_buy_lot(
-                        state,
-                        qty=filled_qty,
-                        price=actual_buy_price,
-                        source="trade",
-                    )
+                    state["inventory_lots"].append({
+                        "qty": filled_qty,
+                        "buy_price": actual_buy_price,
+                        "timestamp": time.time()
+                    })
+                    state["total_base_qty"] = state.get("total_base_qty", 0.0) + filled_qty
 
                     _gsl = state["Gsl"]
                     _gsu = state["Gsu"]
@@ -1800,51 +1764,54 @@ while not _shutdown_requested:
 
         # ── TRAITEMENT SELL ──────────────────────────────────────
         while len(sell_grid) > 0 and price >= sell_grid[0]:
-            # ========== RN-011 : injection du ratio dans le capital effectif ==========
-            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
+            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO
             capital_effectif *= sell_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
                                   state["nu"], state["nl"], state["density_k"])
             state["Gv"] = Gv_local
-            
-            qty_asset = round(Gv_local / price, QTY_DECIMALS)
+            qty_needed = Gv_local / price
 
-            if inv_mgr.inventory_qty(state) >= qty_asset:
-                
+            if state.get("total_base_qty", 0.0) >= qty_needed:
                 touched = sell_grid.pop(0)
                 actual_sell_price, filled_qty = smart_execute_order(exchange.SIDE_SELL, Gv_local, price, state, stress, macro_data)
-                
                 if actual_sell_price is not None and filled_qty > 0:
-                    
-                    lots_consumed = inv_mgr.consume_fifo(state, filled_qty)
-                    
-                    consumed_qty = sum(lot["qty"] for lot in lots_consumed)
-                    if abs(consumed_qty - filled_qty) > 1e-9:
-                        raise RuntimeError(
-                            f"Invariant FIFO violé : vendu={filled_qty:.6f}, consommé={consumed_qty:.6f}"
-                        )
-
+                    remaining = filled_qty
+                    pnl_trade = 0.0
+                    new_lots = []
+                    lots_consumed = []
                     fee_buy = TRADING_FEE_RT + state.get("ema_slippage_buy", 0.0)
                     fee_sell = TRADING_FEE_RT + state.get("ema_slippage_sell", 0.0)
 
-                    pnl_trade = 0.0
-
-                    for lot in lots_consumed:
-                        qty_sold = lot["qty"]
-                        pnl_trade += (actual_sell_price - lot["buy_price"]) * qty_sold
-                        pnl_trade -= (
-                            actual_sell_price * qty_sold * fee_sell
-                            + lot["buy_price"] * qty_sold * fee_buy
+                    for lot in state.get("inventory_lots", []):
+                        if remaining <= 0:
+                            new_lots.append(lot)
+                            continue
+                        if lot["qty"] <= remaining:
+                            qty_sold = lot["qty"]
+                            pnl_trade += (actual_sell_price - lot["buy_price"]) * qty_sold
+                            pnl_trade -= (actual_sell_price * qty_sold * fee_sell) + (lot["buy_price"] * qty_sold * fee_buy)
+                            remaining -= lot["qty"]
+                            lots_consumed.append({"qty": qty_sold, "buy_price": lot["buy_price"]})
+                        else:
+                            qty_sold = remaining
+                            pnl_trade += (actual_sell_price - lot["buy_price"]) * qty_sold
+                            pnl_trade -= (actual_sell_price * qty_sold * fee_sell) + (lot["buy_price"] * qty_sold * fee_buy)
+                            lots_consumed.append({"qty": qty_sold, "buy_price": lot["buy_price"]})
+                            lot["qty"] -= remaining
+                            new_lots.append(lot)
+                            remaining = 0
+                    actually_sold_from_lots = filled_qty - remaining
+                    if remaining > 1e-8:
+                        logger.warning(
+                            f"⚠️ Désynchronisation FIFO vente : {remaining:.6f} {BASE_ASSET} "
+                            f"manquants dans les lots (qty_to_sell={filled_qty:.6f}, "
+                            f"trouvé={actually_sold_from_lots:.6f}) — total_base_qty corrigé"
                         )
-
+                    state["inventory_lots"] = new_lots
+                    state["total_base_qty"] = max(0.0, state.get("total_base_qty", 0.0) - actually_sold_from_lots)
                     state["total_pnl"] = state.get("total_pnl", 0.0) + pnl_trade
+                    logger.info(f"💰 PnL trade (net de frais) : {pnl_trade:+.4f} {QUOTE_ASSET} (vente @ {actual_sell_price:.4f}) | Cumulé={state['total_pnl']:.4f}")
 
-                    logger.info(
-                        f"💰 PnL trade (net de frais) : {pnl_trade:+.4f} {QUOTE_ASSET} "
-                        f"(vente @ {actual_sell_price:.4f}) | "
-                        f"Cumulé={state['total_pnl']:.4f}"
-                    )
-                    
                     _gsl = state["Gsl"]
                     _gsu = state["Gsu"]
                     _dk  = state.get("density_k", 0.65)
@@ -1897,22 +1864,19 @@ while not _shutdown_requested:
             gv_display = state.get("Gv", 0.0)
             pnl_pct = capital_view["pnl_pct"]
 
-            # ========== RN-011 : ajout du ratio dans les logs ==========
             logger.debug(
                 f"📊 {price:.4f} | Capital={total_wallet:.2f} | CapitalGrid={capital_for_grid:.2f} | Stress={stress:.2f} | "
                 f"BUY={len(buy_grid)} SELL={len(sell_grid)} | Gv={gv_display:.2f} | k={state['density_k']:.2f} | "
                 f"Trades={state['total_trades']} | PnL réalisé={state.get('total_pnl',0.0):.4f} | UPnL={unrealized_pnl:+.4f} | "
                 f"PnL total={pnl_pct*100:+.2f}% | Stock={inventory_qty:.4f} (moy={avg_cost:.4f}) | "
-                f"Lots={nb_lots} | EMA_B={state.get('ema_slippage_buy',0.0):.4%} EMA_S={state.get('ema_slippage_sell',0.0):.4%} | "
-                f"Ratio CapitalTarget={capital_ratio:.3f}"
+                f"Lots={nb_lots} | EMA_B={state.get('ema_slippage_buy',0.0):.4%} EMA_S={state.get('ema_slippage_sell',0.0):.4%}"
             )
 
             if time.time() - last_info_log >= 300:
                 last_info_log = time.time()
                 logger.info(
                     f"📊 Résumé {price:.4f} | Wallet={total_wallet:.2f} | PnL total={pnl_pct*100:+.2f}% | "
-                    f"Stock={inventory_qty:.4f} | Trades={state['total_trades']} | Stress={stress:.2f} | "
-                    f"Ratio CapitalTarget={capital_ratio:.3f}"
+                    f"Stock={inventory_qty:.4f} | Trades={state['total_trades']} | Stress={stress:.2f}"
                 )
 
         time.sleep(LOOP_SLEEP)

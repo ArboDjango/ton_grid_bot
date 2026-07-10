@@ -1,0 +1,67 @@
+{
+  "grid_ready": true,
+  "P0": 0.724,
+  "Gul": 0.7606344,
+  "Gll": 0.6882343999999999,
+  "Gsu": 1.0506000000000002,
+  "Gsl": 1.051967178624027,
+  "Gv": 9.229013687386407,
+  "sell_grid": [
+    0.761
+  ],
+  "buy_grid": [
+    0.715,
+    0.708,
+    0.707,
+    0.701,
+    0.694,
+    0.688
+  ],
+  "nu": 5,
+  "nl": 5,
+  "wallet_peak": 114.23386087073112,
+  "total_trades": 92,
+  "failed_count": 0,
+  "total_slippage": 0.06694998609490464,
+  "cycle_recalc": 169,
+  "ema_slippage_buy": 0.0015208788353156509,
+  "ema_slippage_sell": 0.0013937107872505061,
+  "capital_usdc": 102.5629318869583,
+  "total_pnl": 9.146817281232423,
+  "density_k": 0.8597840719483643,
+  "last_rebuild_price": 0.724,
+  "inventory_lots": [
+    {
+      "qty": 6.439610692349181,
+      "buy_price": 0.709,
+      "timestamp": 1782321637.3370907
+    },
+    {
+      "qty": 12.86,
+      "buy_price": 0.6930000000000001,
+      "timestamp": 1782395889.1943913
+    },
+    {
+      "qty": 12.97,
+      "buy_price": 0.6879999999999998,
+      "timestamp": 1782395975.3169067
+    },
+    {
+      "qty": 12.91,
+      "buy_price": 0.7150000000000001,
+      "timestamp": 1782477620.1258612
+    }
+  ],
+  "total_base_qty": 45.179610692349186,
+  "last_grid_rebuild_ts": 1782470374.473126,
+  "last_grid_init_attempt": 1782470374.465211,
+  "DENSITY_ATR_LOW": 0.0042,
+  "DENSITY_ATR_HIGH": 0.0086,
+  "DENSITY_K_MIN": 0.6,
+  "DENSITY_K_MAX": 1.0,
+  "CALIB_REF_ATR_LOW": 0.0042,
+  "CALIB_REF_ATR_HIGH": 0.0086,
+  "CALIB_REF_K_MIN": 0.6,
+  "last_calibration_time": 1782563983.7262123,
+  "ema_slippage": 0.0
+}

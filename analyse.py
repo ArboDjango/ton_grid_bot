@@ -1,57 +1,73 @@
 #!/usr/bin/env python3
 """
-AUDIT BOT GRID - V10b
-Analyse complète du patrimoine vs stratégie Hold.
-PnL Binance incrémental via curseur last_trade_id -> ne relit jamais les vieux trades.
+analyse.py – Moteur de métriques pour Portfolio Manager
+================================================================================
+Version : V1.3 (détection des bots via locks, sans invalidation temporelle,
+          structure enrichie)
 
-Améliorations V8 :
-  - Suppression de l'export HTML (non utilisé)
-  - Correction lecture slippage EMA (ema_slippage_buy / sell)
-  - Ajout vérification d'écart d'inventaire (total_base_qty vs solde réel)
-  - Ajout de total_base_qty dans les exports
-  - alpha_pct conservé mais basé sur capital_usdc (définition bot)
-  - Nettoyage des imports inutiles
+Rôle :
+  - Détecter les bots réellement actifs à partir des fichiers lock_*.pid
+  - Charger leur état et produire un contrat de données fiable
+  - Fallback sur les fichiers state_*.json si aucun lock n'est trouvé
 
-Améliorations V10b :
-  - Export explicite de pnl_bot (= state["total_pnl"]) dans le JSONL sous le
-    nom "pnl_bot", à distinguer de "pnl_real" (PnL Binance cash net).
-    Propriétés de pnl_bot :
-      * Toujours >= 0 quand la grille fonctionne (somme des profits round-trips)
-      * Indépendant des achats d'inventaire et du sens du marché
-      * Mesure exactement l'edge de market-making du bot
-    Le portfolio_manager score sur delta_pnl_bot (= pnl_bot_end - pnl_bot_start)
-    plutôt que sur delta_pnl (pnl_real), plus bruité et directionnel.
+Invariants (vérifiés systématiquement par fail-fast) :
+  1. inventory_qty == sum(lot["qty"])
+  2. inventory_cost == sum(lot["qty"] * lot["buy_price"])
+  3. wallet == capital_usdc + total_pnl + pnl_latent
+  4. 0 <= drawdown_pct <= 1
+
+Ce fichier ne produit plus de rapport humain.
+================================================================================
 """
+
+# ==========================================================
+# AUDIT METRICS CONTRACT V1
+#
+# Ce fichier constitue la source officielle des métriques
+# consommées par Portfolio Manager.
+#
+# Toute évolution devra :
+#   - rester rétrocompatible
+#   - ou incrémenter schema_version.
+#
+# Les calculs comptables sont considérés comme figés.
+# ==========================================================
+
+
 import os
 import sys
 import json
+import glob
+import time
 import logging
 import argparse
 from datetime import datetime, timezone
-from binance.client import Client
-from binance.exceptions import BinanceAPIException, BinanceRequestException
-from dotenv import load_dotenv
 
-load_dotenv()
+# ─── IMPORT EXCHANGE ──────────────────────────────────────────
+try:
+    from exchange_base import ExchangeBase
+except ImportError:
+    ExchangeBase = None
+    print("⚠️  exchange_base introuvable. Assurez-vous qu'il est dans le PYTHONPATH.")
 
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-SNAPSHOT_FILE      = "snapshot_t0.json"
-PNL_CACHE          = "pnl_cache.json"
-LOG_FILE           = "audit.log"
+# ─── IMPORT INVENTORY MANAGER ────────────────────────────────
+import inventory_manager as inv_mgr
 
-# Clés réservées du snapshot — tout le reste est un token tradé
-SNAPSHOT_META_KEYS = {"date_reference","timestamp_reference","CASH"}
-SNAPSHOT_REQUIRED_KEYS = ["CASH"]
+# ─── CONSTANTES ──────────────────────────────────────────────
+DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "gateio").lower()
+SUPPORTED_QUOTES = ("USDC", "USDT")
+INVARIANT_EPSILON = 1e-6
+# Le timestamp est conservé pour information, mais n'est plus utilisé pour invalider un lock.
 
-# Construit dynamiquement par get_snapshot()
-PAIRES: dict = {}
-
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
+# ─── LOGGING ──────────────────────────────────────────────────
+LOG_FILE = "analyse.log"
+logger = logging.getLogger(__name__)
 
 def setup_logging():
     logging.basicConfig(
@@ -64,586 +80,425 @@ def setup_logging():
         ]
     )
 
-logger = logging.getLogger(__name__)
+# ─── EXCHANGE FACTORY ────────────────────────────────────────
+def create_exchange(name: str) -> "ExchangeBase":
+    if name == "binance":
+        from exchange_binance import ExchangeBinance
+        return ExchangeBinance()
+    elif name == "gateio":
+        from exchange_gateio import ExchangeGateIO
+        return ExchangeGateIO()
+    elif name == "coinbase":
+        from exchange_coinbase import ExchangeCoinbase
+        return ExchangeCoinbase()
+    raise ValueError(f"Exchange non supporté : {name}")
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
+def exchange_key(exchange: "ExchangeBase") -> str:
+    return "".join(ch for ch in exchange.NAME.lower() if ch.isalnum())
 
-def fmt_signed(val: float, dec: int = 2) -> str:
-    return f"{'+' if val >= 0 else ''}{val:.{dec}f}"
-
-def pct(val: float, ref: float) -> str:
-    if ref == 0:
-        return "n/a"
-    return f"{fmt_signed(val / ref * 100, 2)}%"
-
-def _cash_usdc(snap_cash: dict) -> float:
+# ─── DÉTECTION DES BOTS (ANCIENNE, FALLBACK) ──────────────────
+def detect_bots(exchange_key: str, quote: str = None) -> dict:
     """
-    Lit le montant USDC dans snap['CASH'] de façon tolérante à la casse.
-    bot_V101c.py écrit/lit la clé en majuscules ('USDC'), comme dans
-    snapshot_t0.json actuel ({"CASH": {"USDC": 339}}). On accepte aussi
-    'usdc' / 'Usdc' pour rester compatible avec d'anciens snapshots.
+    Détecte les fichiers state_{exchange_key}_*.json.
+    Retourne un dictionnaire {symbole: chemin_du_state}.
+    Utilisé uniquement en fallback si aucun lock valide n'est trouvé.
     """
-    if not isinstance(snap_cash, dict):
-        return 0.0
-    for key in ("USDC", "usdc", "Usdc"):
-        if key in snap_cash:
-            return float(snap_cash[key])
-    return 0.0
+    pattern = f"state_{exchange_key}_*.json"
+    bots = {}
+    for sf in sorted(glob.glob(pattern)):
+        stem = os.path.basename(sf).replace("state_", "").replace(".json", "")
+        if stem.startswith(f"{exchange_key}_"):
+            symbol_part = stem[len(exchange_key)+1:]
+        else:
+            symbol_part = stem
+        symbol = symbol_part.upper()
+        if quote:
+            if not symbol.endswith(quote):
+                continue
+        else:
+            found_quote = None
+            for q in SUPPORTED_QUOTES:
+                if symbol.endswith(q):
+                    found_quote = q
+                    break
+            if not found_quote:
+                continue
+        bots[symbol] = sf
+    return bots
 
-def _date_reference(snap: dict) -> str:
+# ─── NOUVELLE DÉTECTION PAR LOCKS ─────────────────────────────
+def is_lock_valid(lock_path: str) -> bool:
     """
-    Renvoie un libellé de date de référence pour l'affichage/export.
-    bot_V101c.py n'écrit que 'timestamp_reference' (pas 'date_reference'),
-    donc on retombe sur ce champ si 'date_reference' est absent.
+    Vérifie si un fichier lock correspond à un processus toujours actif.
+    Le timestamp est conservé mais n'est pas utilisé pour invalider le lock.
+    Retourne True si le lock est valide, False sinon.
     """
-    if "date_reference" in snap:
-        return snap["date_reference"]
-    if "timestamp_reference" in snap:
-        return snap["timestamp_reference"]
-    return "inconnue"
-
-# ─────────────────────────────────────────────
-# SNAPSHOT — avec validation
-# ─────────────────────────────────────────────
-
-def get_snapshot() -> dict:
-    global PAIRES
-
-    if not os.path.exists(SNAPSHOT_FILE):
-        raise FileNotFoundError(f"Snapshot introuvable : {SNAPSHOT_FILE}")
-    with open(SNAPSHOT_FILE) as f:
-        snap = json.load(f)
-        
-    if (
-        "date_reference" not in snap
-        and
-        "timestamp_reference" not in snap
-    ):
-        raise ValueError(
-            "snapshot_t0.json doit contenir "
-            "'date_reference' ou 'timestamp_reference'"
-        )
-
-    missing = [k for k in SNAPSHOT_REQUIRED_KEYS if k not in snap]
-    if missing:
-        raise ValueError(
-            f"snapshot_t0.json incomplet — clés manquantes : {', '.join(missing)}"
-        )
-    # FIX : la clé CASH est en majuscules dans le snapshot réel ("USDC"),
-    # on valide donc via le helper tolérant à la casse au lieu de chercher
-    # littéralement "usdc".
-    if _cash_usdc(snap.get("CASH", {})) == 0.0 and not any(
-        k in snap.get("CASH", {}) for k in ("USDC", "usdc", "Usdc")
-    ):
-        raise ValueError("snapshot_t0.json : clé 'USDC' (ou 'usdc') manquante dans CASH")
-
-    # Détection automatique des tokens
-    token_names = [k for k in snap if k not in SNAPSHOT_META_KEYS]
-    if not token_names:
-        raise ValueError("snapshot_t0.json : aucun token détecté (hors date_reference et CASH)")
-
-    for name in token_names:
-        if "stock" not in snap[name]:
-            raise ValueError(
-                f"snapshot_t0.json : clé 'stock' manquante pour le token {name}"
-            )
-
-    PAIRES = {
-        name: {"symbol": f"{name}USDC", "asset": name}
-        for name in token_names
-    }
-    logger.info(f"Tokens détectés depuis snapshot : {list(PAIRES.keys())}")
-
-    return snap
-
-# ─────────────────────────────────────────────
-# STATE BOT — avec warnings explicites
-# ─────────────────────────────────────────────
-
-def load_bot_state(symbol: str) -> dict:
-    sf = f"state_{symbol.lower()}.json"
-    if not os.path.exists(sf):
-        logger.warning(f"[{symbol}] Fichier state absent ({sf}) — grille et capital_usdc ignorés")
-        return {}
     try:
-        with open(sf) as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logger.warning(f"[{symbol}] Fichier state corrompu ({sf}) : {e} — ignoré")
+        with open(lock_path, "r") as f:
+            content = f.read().strip()
+        parts = content.split(":")
+        if len(parts) != 2:
+            return False
+        pid = int(parts[0])
+        # timestamp = int(parts[1])  # conservé mais non utilisé
+
+        # Vérifier si le processus est toujours en vie
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False  # process mort
+
+        return True
+    except Exception:
+        return False
+
+def detect_active_bots(exchange_key: str, exchange_name: str, quote: str = None) -> dict:
+    """
+    Détecte les bots actifs à partir des fichiers lock_*.pid.
+    Pour chaque lock valide, vérifie que le fichier state correspondant existe.
+    Retourne un dictionnaire {symbole: {"state_file": ..., "lock_file": ..., "pid": ...}}.
+    Si aucun lock valide n'est trouvé, retourne un dictionnaire vide.
+    """
+    lock_files = glob.glob("lock_*.pid")
+    if not lock_files:
+        logger.info("Aucun fichier lock trouvé.")
         return {}
 
-def get_allocated_usdc() -> float:
-    total = 0.0
-    for cfg in PAIRES.values():
-        total += load_bot_state(cfg["symbol"]).get("capital_usdc", 0.0)
-    return total
+    active_bots = {}
+    for lock_path in lock_files:
+        # Extraire le symbole du nom du fichier lock
+        basename = os.path.basename(lock_path)
+        if not basename.startswith("lock_") or not basename.endswith(".pid"):
+            continue
+        symbol_lower = basename[5:-4]  # "lock_" + symbol + ".pid"
+        symbol = symbol_lower.upper()
 
-# ─────────────────────────────────────────────
-# PNL INCRÉMENTAL — CŒUR DU SYSTÈME
-# ─────────────────────────────────────────────
+        # Filtrer par quote si demandé
+        if quote:
+            if not symbol.endswith(quote):
+                continue
+        else:
+            # Vérifier que le symbole est bien dans une quote supportée
+            if not any(symbol.endswith(q) for q in SUPPORTED_QUOTES):
+                continue
 
-def load_pnl_cache() -> dict:
-    """
-    Structure :
-    {
-      "INJUSDC":  { "last_trade_id": 123, "usdc_spent": 0.0,
-                    "usdc_gained": 0.0,   "nb_trades": 0 },
-      ...
-    }
-    """
-    if os.path.exists(PNL_CACHE):
+        # Vérifier que le lock est valide (processus vivant)
+        if not is_lock_valid(lock_path):
+            logger.debug(f"Lock {lock_path} invalide (processus mort), ignoré.")
+            continue
+
+        # Lire le contenu du lock pour récupérer le PID
         try:
-            with open(PNL_CACHE) as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Cache PnL corrompu ({PNL_CACHE}) : {e} — réinitialisé")
-    return {}
+            with open(lock_path, "r") as f:
+                parts = f.read().strip().split(":")
+            pid = int(parts[0]) if len(parts) >= 1 else None
+        except Exception:
+            pid = None
 
-def save_pnl_cache(cache: dict):
-    with open(PNL_CACHE, "w") as f:
-        json.dump(cache, f, indent=2)
-    logger.info(f"Cache PnL sauvegardé -> {PNL_CACHE}")
+        # Construire le chemin du fichier state
+        state_file = f"state_{exchange_key}_{symbol_lower}.json"
+        if not os.path.exists(state_file):
+            logger.error(f"Lock présent pour {symbol} mais state {state_file} introuvable → bot ignoré")
+            continue
 
-def reset_pnl_cache():
-    if os.path.exists(PNL_CACHE):
-        os.remove(PNL_CACHE)
-        logger.info(f"Cache PnL supprimé ({PNL_CACHE}) — re-scan complet au prochain lancement")
-    else:
-        logger.info("Aucun cache PnL à supprimer")
-
-def fetch_new_trades(client: Client, symbol: str,
-                     cache: dict, t0_ms: int) -> dict:
-    """
-    Lit uniquement les trades nouveaux depuis le dernier curseur.
-    - 1er lancement  : startTime = T0 UTC (scan initial complet depuis T0)
-    - Suivants       : fromId = last_trade_id + 1 (incrémental)
-    Gère la pagination automatiquement si > 1000 trades nouveaux.
-    Détecte un curseur invalide (réponse vide inattendue) et avertit.
-    """
-    entry = cache.get(symbol, {
-        "last_trade_id": None,
-        "usdc_spent":    0.0,
-        "usdc_gained":   0.0,
-        "nb_trades":     0,
-    })
-
-    new_total  = 0
-    first_call = True
-
-    if entry["last_trade_id"] is None:
-        kwargs = {"symbol": symbol, "startTime": t0_ms, "limit": 1000}
-        logger.info(f"[{symbol}] Premier scan depuis T0...")
-    else:
-        kwargs = {"symbol": symbol, "fromId": entry["last_trade_id"] + 1, "limit": 1000}
-
-    while True:
-        try:
-            trades = client.get_my_trades(**kwargs)
-        except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"[{symbol}] Erreur API Binance lors de get_my_trades : {e}")
-            raise
-
-        if not trades:
-            if first_call and entry["last_trade_id"] is not None:
-                logger.warning(
-                    f"[{symbol}] Aucun trade retourné depuis fromId={entry['last_trade_id'] + 1}. "
-                    f"Si suspect, lancez avec --reset-cache pour forcer un re-scan."
-                )
-            break
-
-        first_call = False
-
-        for t in trades:
-            qty       = float(t["quoteQty"])
-            comm_usdc = float(t["commission"]) if t["commissionAsset"] == "USDC" else 0.0
-            if t["isBuyer"]:
-                entry["usdc_spent"]  += qty + comm_usdc
-            else:
-                entry["usdc_gained"] += qty - comm_usdc
-
-        entry["last_trade_id"] = trades[-1]["id"]
-        new_total += len(trades)
-
-        if len(trades) < 1000:
-            break
-        kwargs = {"symbol": symbol, "fromId": entry["last_trade_id"] + 1, "limit": 1000}
-
-    entry["nb_trades"] += new_total
-    if new_total > 0:
-        logger.info(f"[{symbol}] +{new_total} nouveaux trades intégrés "
-                    f"(total cumulé : {entry['nb_trades']})")
-    else:
-        logger.info(f"[{symbol}] Aucun nouveau trade depuis le dernier audit")
-
-    return entry
-
-# ─────────────────────────────────────────────
-# ANALYSE PRINCIPALE
-# ─────────────────────────────────────────────
-
-def run_audit(client: Client, snapshot: dict) -> dict:
-    # Timestamp T0
-    if "timestamp_reference" in snapshot:
-        t0 = datetime.fromisoformat(snapshot["timestamp_reference"].replace("Z", "+00:00"))
-    else:
-        t0 = datetime.strptime(snapshot["date_reference"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    t0_ms = int(t0.timestamp() * 1000)
-
-    # Mise à jour incrémentale des trades
-    cache = load_pnl_cache()
-    logger.info("Mise à jour incrémentale des trades Binance...")
-    for cfg in PAIRES.values():
-        cache[cfg["symbol"]] = fetch_new_trades(client, cfg["symbol"], cache, t0_ms)
-    save_pnl_cache(cache)
-
-    # Récupération du cash actuel
-    cash_free, cash_locked, cash_actuel = get_cash_balance(client)
-
-    results = {}
-    valeur_crypto_actuelle = 0.0
-    valeur_crypto_hold = 0.0
-    pnl_reel_total = 0.0
-    trades_total = 0
-
-    for name, cfg in PAIRES.items():
-        try:
-            balance = client.get_asset_balance(asset=cfg["asset"])
-            prix = float(client.get_ticker(symbol=cfg["symbol"])["lastPrice"])
-        except (BinanceAPIException, BinanceRequestException) as e:
-            logger.error(f"[{cfg['symbol']}] Erreur API : {e}")
-            raise
-
-        solde_actuel = float(balance["free"]) + float(balance["locked"])
-        stock_t0 = snapshot[name]["stock"]
-        val_actuelle = solde_actuel * prix
-        val_hold = stock_t0 * prix
-        delta_tokens = solde_actuel - stock_t0
-
-        c = cache[cfg["symbol"]]
-        pnl_reel = c["usdc_gained"] - c["usdc_spent"]
-        nb_trades = c["nb_trades"]
-
-        delta_tokens_value = delta_tokens * prix
-        alpha_pair = pnl_reel + delta_tokens_value
-
-        state = load_bot_state(cfg["symbol"])
-
-        # Valeur réelle du portefeuille du bot
-        capital_usdc = state.get("capital_usdc", 0.0)
-
-        # Budget attribué par portfolio_manager
-        budget_usdc = state.get(
-            "budget_usdc",
-            capital_usdc
-        )
-
-        wallet_peak = state.get("wallet_peak", capital_usdc)
-
-        # V10b : capital_usdc représente déjà le capital virtuel du bot.
-        # Ne pas ajouter la valeur de l'inventaire, sinon on le compte deux fois.
-        pnl_bot = state.get("total_pnl", 0.0)
-        total_wallet = (
-            capital_usdc
-            + state.get("total_pnl", 0.0)
-        )
-
-        drawdown_pct = (
-            max(0.0, 1.0 - total_wallet / wallet_peak)
-            if wallet_peak > 0
-            else 0.0
-        )
-
-        alpha_pct = (alpha_pair / capital_usdc) if capital_usdc > 0 else 0.0
-
-        ema_buy = state.get("ema_slippage_buy", 0.0)
-        ema_sell = state.get("ema_slippage_sell", 0.0)
-        ema_slip = max(ema_buy, ema_sell) if (ema_buy or ema_sell) else None
-
-        gv = state.get("Gv")
-        density_k = state.get("density_k")
-        buy_grid = state.get("buy_grid", [])
-        sell_grid = state.get("sell_grid", [])
-        nb_levels = len(buy_grid) + len(sell_grid)
-        grille_prete = state.get("grid_ready", False)
-
-        total_base_qty = state.get("total_base_qty", 0.0)
-        if abs(total_base_qty - solde_actuel) > 1e-6:
-            logger.warning(f"[{name}] Écart inventaire : state={total_base_qty:.6f}, réel={solde_actuel:.6f}")
-
-        valeur_crypto_actuelle += val_actuelle
-        valeur_crypto_hold += val_hold
-        pnl_reel_total += pnl_reel
-        trades_total += nb_trades
-
-        results[name] = {
-            "solde_actuel": solde_actuel,
-            "stock_t0": stock_t0,
-            "delta_tokens": delta_tokens,
-            "prix": prix,
-            "val_actuelle": val_actuelle,
-            "val_hold": val_hold,
-            "usdc_spent": c["usdc_spent"],
-            "usdc_gained": c["usdc_gained"],
-            "pnl_reel": pnl_reel,
-            "nb_trades": nb_trades,
-            "grille_prete": grille_prete,
-            "sell_grid": sell_grid,
-            "buy_grid": buy_grid,
-            "delta_tokens_value": delta_tokens_value,
-            "alpha_pair": alpha_pair,
-            "capital_usdc": capital_usdc,
-            "budget_usdc": budget_usdc,
-            "pnl_bot": pnl_bot,
-            "alpha_pct": alpha_pct,
-            "wallet_peak": wallet_peak,
-            "total_wallet": total_wallet,
-            "drawdown_pct": drawdown_pct,
-            "efficiency": (alpha_pair / nb_trades) if nb_trades > 0 else 0.0,
-            "ema_slip": ema_slip,
-            "ema_slippage_buy": ema_buy,
-            "ema_slippage_sell": ema_sell,
-            "gv": gv,
-            "density_k": density_k,
-            "nb_levels": nb_levels,
-            "total_base_qty": total_base_qty,
+        active_bots[symbol] = {
+            "state_file": state_file,
+            "lock_file": lock_path,
+            "pid": pid,
         }
 
-    # Calcul F0 recommandé (utilise cash_actuel)
-    total_crypto_value = sum(d["val_actuelle"] for d in results.values())
-    for name, d in results.items():
-        poids = d["val_actuelle"] / total_crypto_value if total_crypto_value > 0 else 1.0 / len(results)
-        f0_bot = d["val_actuelle"] + cash_actuel * poids
-        f0_recommande = round(f0_bot * 0.90, 2)
-        results[name]["f0_estime"] = round(f0_bot, 2)
-        results[name]["f0_recommande"] = f0_recommande
-        logger.info(f"F0 estimé {name} : {f0_bot:.2f}$ | Recommandé : {f0_recommande:.2f}$")
+    return active_bots
 
-    patrimoine_actuel = valeur_crypto_actuelle + cash_actuel
-    patrimoine_hold = valeur_crypto_hold + snapshot["CASH"]["usdc"]
-    alpha_brut = patrimoine_actuel - patrimoine_hold
-    alpha_latent = valeur_crypto_actuelle - valeur_crypto_hold
-    delta_tokens_value_sum = sum(d["delta_tokens"] * d["prix"] for d in results.values())
-    alpha_securise = pnl_reel_total + delta_tokens_value_sum
-    ratio_cristallisation = (alpha_securise / alpha_brut * 100) if alpha_brut != 0 else 0.0
+# ─── CHARGEMENT D'UN STATE ──────────────────────────────────
+def load_state(state_file: str) -> dict:
+    """Charge le state JSON et retourne un dictionnaire avec des valeurs par défaut."""
+    defaults = {
+        "capital_usdc": 0.0,
+        "total_pnl": 0.0,
+        "wallet_peak": 0.0,
+        "total_trades": 0,
+        "grid_ready": False,
+        "Gv": 0.0,
+        "density_k": 0.65,
+        "sell_grid": [],
+        "buy_grid": [],
+        "inventory_lots": [],
+        "inventory_cost": 0.0,
+        "P0": None,
+    }
+    if not os.path.exists(state_file):
+        logger.warning(f"Fichier state introuvable : {state_file}")
+        return defaults
+    try:
+        with open(state_file, "r") as f:
+            data = json.load(f)
+        for k, v in defaults.items():
+            data.setdefault(k, v)
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Erreur de décodage JSON dans {state_file} : {e}")
+        return defaults
 
-    logger.info(f"Audit terminé — Patrimoine actuel : {patrimoine_actuel:.2f} $  "
-                f"| Alpha brut : {fmt_signed(alpha_brut)} $  "
-                f"| PnL réel : {fmt_signed(pnl_reel_total, 4)} $  "
-                f"| Trades : {trades_total}")
+# ─── VÉRIFICATIONS DES INVARIANTS ─────────────────────────────
+def verify_invariants(state: dict, metrics: dict):
+    """
+    Vérifie les invariants comptables.
+    Lance une RuntimeError en cas de violation (fail-fast).
+    """
+    # Invariant 1 : inventory_qty == somme des lots
+    lots = state.get("inventory_lots", [])
+    computed_qty = sum(float(lot.get("qty", 0.0)) for lot in lots)
+    if abs(metrics["inventory_qty"] - computed_qty) > INVARIANT_EPSILON:
+        raise RuntimeError(
+            f"Invariant 1 violé : inventory_qty={metrics['inventory_qty']:.8f}, "
+            f"somme des lots={computed_qty:.8f}"
+        )
+
+    # Invariant 2 : inventory_cost == somme(qty * buy_price)
+    computed_cost = sum(float(lot.get("qty", 0.0)) * float(lot.get("buy_price", 0.0)) for lot in lots)
+    if abs(metrics["inventory_cost"] - computed_cost) > INVARIANT_EPSILON:
+        raise RuntimeError(
+            f"Invariant 2 violé : inventory_cost={metrics['inventory_cost']:.8f}, "
+            f"coût recalculé={computed_cost:.8f}"
+        )
+
+    # Invariant 3 : wallet == capital_usdc + total_pnl + pnl_latent
+    capital_usdc = metrics["capital_usdc"]
+    total_pnl = metrics["total_pnl"]
+    pnl_latent = metrics["pnl_latent"]
+    wallet = metrics["wallet"]
+    computed_wallet = capital_usdc + total_pnl + pnl_latent
+    if abs(wallet - computed_wallet) > INVARIANT_EPSILON:
+        raise RuntimeError(
+            f"Invariant 3 violé : wallet={wallet:.8f}, "
+            f"capital+pnl+latent={computed_wallet:.8f}"
+        )
+
+    # Invariant 4 : drawdown_pct dans [0, 1]
+    dd = metrics["drawdown_pct"]
+    if not (0.0 <= dd <= 1.0):
+        raise RuntimeError(
+            f"Invariant 4 violé : drawdown_pct={dd:.8f} hors de l'intervalle [0, 1]"
+        )
+
+    logger.debug("✅ Tous les invariants sont respectés.")
+
+
+# ─── TRADING METRICS ─────────────────────────────────────────────
+
+def compute_trading_metrics(state: dict) -> dict:
+    """
+    Métriques décrivant l'activité de trading du bot.
+
+    Ces métriques sont purement observationnelles.
+    """
 
     return {
-        "date_reference": snapshot["date_reference"],
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "paires": results,
-        "cash_free": cash_free,
-        "cash_locked": cash_locked,
-        "cash_actuel": cash_actuel,
-        "cash_alloue": get_allocated_usdc(),
-        "cash_t0": snapshot["CASH"]["usdc"],
-        "valeur_crypto_actuelle": valeur_crypto_actuelle,
-        "valeur_crypto_hold": valeur_crypto_hold,
-        "patrimoine_actuel": patrimoine_actuel,
-        "patrimoine_hold": patrimoine_hold,
-        "alpha_brut": alpha_brut,
-        "alpha_latent": alpha_latent,
-        "alpha_securise": alpha_securise,
-        "ratio_cristallisation": ratio_cristallisation,
-        "pnl_reel_total": pnl_reel_total,
-        "delta_tokens_value": delta_tokens_value_sum,
-        "trades_total": trades_total,
-    }
-
-def get_cash_balance(client: Client) -> tuple[float, float, float]:
-    """Retourne (cash_free, cash_locked, cash_actuel)"""
-    try:
-        usdc_bal = client.get_asset_balance(asset="USDC")
-    except (BinanceAPIException, BinanceRequestException) as e:
-        logger.error(f"Erreur API Binance lors de la récupération du solde USDC : {e}")
-        raise
-    cash_free   = float(usdc_bal["free"])
-    cash_locked = float(usdc_bal["locked"])
-    cash_actuel = cash_free + cash_locked
-    return cash_free, cash_locked, cash_actuel
-
-# ─────────────────────────────────────────────
-# AFFICHAGE CONSOLE
-# ─────────────────────────────────────────────
-
-def print_report(r: dict):
-    W   = 62
-    SEP = "=" * W
-    sep = "-" * W
-
-    print(f"\n{SEP}")
-    print(f"  AUDIT PATRIMOINE GRID BOT — {r['timestamp']}")
-    print(f"  Référence T0 : {r['date_reference']}")
-    print(SEP)
-
-    for name, d in r["paires"].items():
-        status    = "OK" if d["grille_prete"] else "KO"
-        delta_ico = "+" if d["delta_tokens"] >= 0 else ""
-        pnl_ico   = "+" if d["pnl_reel"] >= 0 else ""
-        print(f"\n  [{status}] {name}/USDC  @  {d['prix']:.4f} $")
-        print(sep)
-        print(f"    Stock T0           : {d['stock_t0']:.4f} tokens")
-        print(f"    Stock Actuel       : {d['solde_actuel']:.4f} tokens  "
-              f"({delta_ico}{d['delta_tokens']:.4f})")
-        print(f"    Val. Actuelle      : {d['val_actuelle']:.2f} $")
-        print(f"    Val. Hold Pure     : {d['val_hold']:.2f} $")
-        print(sep)
-        print(f"    USDC dépensé       : {d['usdc_spent']:.4f} $")
-        print(f"    USDC encaissé      : {d['usdc_gained']:.4f} $")
-        print(f"    PnL Réel (Binance) : {fmt_signed(d['pnl_reel'], 4)} $  <- source de vérité")
-        print(f"    Trades totaux      : {d['nb_trades']}")
-        print(f"    Grille BUY / SELL  : {len(d['buy_grid'])} / {len(d['sell_grid'])}")
-        if d["total_base_qty"] != 0:
-            print(f"    Inventaire local   : {d['total_base_qty']:.6f} tokens (state['total_base_qty'])")
-
-    print(f"\n{SEP}")
-    print(f"  SYNTHESE PATRIMOINE")
-    print(sep)
-    print(f"    Cash USDC T0       : {r['cash_t0']:.2f} $")
-    print(f"    Cash USDC Actuel   : {r['cash_actuel']:.2f} $  (free {r['cash_free']:.2f} + locked {r['cash_locked']:.2f})")
-    print(f"    Cash USDC Alloué   : {r['cash_alloue']:.2f} $  (capital initial bots, informatif)")
-    print(f"    Crypto (Actuel)    : {r['valeur_crypto_actuelle']:.2f} $")
-    print(f"    Crypto (Hold)      : {r['valeur_crypto_hold']:.2f} $")
-    print(sep)
-    print(f"    Patrimoine Actuel  : {r['patrimoine_actuel']:.2f} $")
-    print(f"    Patrimoine Hold    : {r['patrimoine_hold']:.2f} $")
-    print(sep)
-    print(f"    ALPHA BRUT         : {fmt_signed(r['alpha_brut'])} $  ({pct(r['alpha_brut'], r['patrimoine_hold'])})")
-    print(sep)
-    print(f"    Alpha latent       : {fmt_signed(r['alpha_latent'])} $  (prix-dépendant)")
-    print(f"    Alpha sécurisé     : {fmt_signed(r['alpha_securise'], 4)} $  (PnL cash + tokens valorisés)")
-    print(f"      dont PnL cash    : {fmt_signed(r['pnl_reel_total'], 4)} $")
-    print(f"      dont delta tok.  : {fmt_signed(r['delta_tokens_value'], 4)} $")
-
-    c     = r["ratio_cristallisation"]
-    ico_c = "[!!]" if c < 20 else ("[~]" if c < 50 else "[OK]")
-    print(f"    Cristallisation    : {ico_c} {c:.1f}%")
-    print(sep)
-    print(f"    PnL Réel Total     : {fmt_signed(r['pnl_reel_total'], 4)} $")
-    print(f"    Trades Totaux      : {r['trades_total']}")
-    print(SEP)
-
-def export_metrics_json(r, filename="audit_metrics.json"):
-    out = {
-        "timestamp": r["timestamp"],
-        "date_reference": r["date_reference"],
-        "pairs": {}
-    }
-
-    for pair, d in r["paires"].items():
-        out["pairs"][pair] = {
-            "alpha_pair":        d["alpha_pair"],
-            "alpha_pct":         d["alpha_pct"],
-            "pnl_real":          d["pnl_reel"],
-            "delta_token_value": d["delta_tokens_value"],
-            "capital_usdc":      d["capital_usdc"],
-            "budget_usdc":       d["budget_usdc"],
-            "pnl_bot":           d["pnl_bot"],
-            "wallet_peak":      d["wallet_peak"],
-            "total_wallet":     d["total_wallet"],
-            "drawdown_pct":     d["drawdown_pct"],
-            "trades":            d["nb_trades"],
-            "price":             d["prix"],
-            "ema_slip":          d["ema_slip"],
-            "gv":                d["gv"],
-            "density_k":         d["density_k"],
-            "nb_levels":         d["nb_levels"],
-            "f0_estime":         d["f0_estime"],
-            "f0_recommande":     d["f0_recommande"],
-            "total_base_qty":    d["total_base_qty"],
+        "trading": {
+            "total_trades": state.get("total_trades", 0),
         }
+    }
 
-    with open(filename, "w") as f:
-        json.dump(out, f, indent=2)
 
-    # Historisation Portfolio Manager (JSONL)
-    # Contrat de champs avec portfolio_manager :
-    #   pnl_bot  = state["total_pnl"] = somme cumulée des profits round-trips (>= 0)
-    #   pnl_real = usdc_gained - usdc_spent  (bruité, directionnel, peut être < 0)
-    # Le scorer utilise delta_pnl_bot ; pnl_real est conservé pour la vérification.
-    # alpha_pair est conservé comme fallback pour les lignes historiques sans pnl_bot.
-    history_file = "portfolio_history.jsonl"
-    with open(history_file, "a") as f:
-        for pair, d in out["pairs"].items():
-            row = {
-                "timestamp":         out["timestamp"],
-                "pair":              pair,
-                # ── scoring (portfolio_manager) ─────────────────────────
-                "pnl_bot":           d["pnl_bot"],           # state["total_pnl"] — toujours >= 0
-                "alpha_pair":        d["alpha_pair"],         # fallback pour lignes sans pnl_bot
-                "alpha_pct":         d["alpha_pct"],
-                "pnl_real":          d["pnl_real"],           # display / vérification uniquement
-                "delta_token_value": d["delta_token_value"],
-                # ── capital et drawdown ──────────────────────────────────
-                "capital_usdc":      d["capital_usdc"],
-                "budget_usdc":       d["budget_usdc"],
-                "wallet_peak":       d["wallet_peak"],
-                "total_wallet":      d["total_wallet"],
-                "drawdown_pct":      d["drawdown_pct"],
-                # ── activité ────────────────────────────────────────────
-                "trades":            d["trades"],
-                # ── infos grille ────────────────────────────────────────
-                "price":             d["price"],
-                "ema_slip":          d["ema_slip"],
-                "gv":                d["gv"],
-                "density_k":         d["density_k"],
-                "nb_levels":         d["nb_levels"],
-                "f0_estime":         d["f0_estime"],
-                "f0_recommande":     d["f0_recommande"],
-                "total_base_qty":    d["total_base_qty"],
-            }
-            f.write(json.dumps(row) + "\n")
+# ─── CALCUL DES MÉTRIQUES ──────────────────────────────────
+def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str) -> dict:
+    """
+    Calcule les métriques fondamentales à partir du state et du prix.
+    Retourne un dictionnaire conforme au contrat V1.1.
+    Les invariants sont vérifiés avant le retour.
+    """
+    # --- 1. Données d'inventaire (via inventory_manager) ---
+    inventory_qty = inv_mgr.inventory_qty(state)
+    inventory_cost = inv_mgr.inventory_cost(state)
+    inventory_value = inventory_qty * price
+    pnl_latent = inventory_value - inventory_cost
 
-    logger.info(f"Metrics Portfolio -> {filename}")
+    # --- 2. Métriques du wallet ---
+    capital_usdc = state.get("capital_usdc", 0.0)
+    total_pnl = state.get("total_pnl", 0.0)
+    wallet = capital_usdc + total_pnl + pnl_latent
 
-# ─────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────
+    # --- 3. Peak (correction : max avec le wallet courant) ---
+    wallet_peak = max(state.get("wallet_peak", 0.0), wallet)
 
+    # --- 4. Drawdown (correction : borne explicite) ---
+    if wallet_peak > 0:
+        drawdown_pct = max(0.0, min(1.0, 1.0 - wallet / wallet_peak))
+    else:
+        drawdown_pct = 0.0
+
+    # --- 5. Alpha ---
+    alpha = total_pnl + pnl_latent
+    alpha_pct = alpha / capital_usdc if capital_usdc > 0 else 0.0
+
+    # --- 6. Trading metrics ---
+    trading = compute_trading_metrics(state)
+    
+    # --- 7. Diagnostics (déplacés dans un sous-objet) ---
+    sell_grid = state.get("sell_grid", [])
+    buy_grid = state.get("buy_grid", [])
+    diagnostics = {
+        "price": price,
+        "grid_ready": state.get("grid_ready", False),
+        "gv": state.get("Gv", 0.0),
+        "density_k": state.get("density_k", 0.65),
+        "nb_levels": len(sell_grid) + len(buy_grid),
+    }
+
+    # --- 8. Construction du résultat brut ---
+    result = {
+        # Identité de la paire (rend l'objet autonome)
+        "symbol": symbol,
+        "exchange": exchange_name,
+
+        # Métriques économiques (premier niveau)
+        "capital_usdc": capital_usdc,
+        "wallet": wallet,
+        "wallet_peak": wallet_peak,
+        "total_pnl": total_pnl,
+        "inventory_qty": inventory_qty,
+        "inventory_cost": inventory_cost,
+        "inventory_value": inventory_value,
+        "pnl_latent": pnl_latent,
+        "alpha": alpha,
+        "alpha_pct": alpha_pct,
+        "drawdown_pct": drawdown_pct,
+
+        # Nom métier cohérent
+        **trading,
+
+        # Diagnostics (isolés, jamais utilisés par le PM)
+        "diagnostics": diagnostics,
+    }
+
+    # --- 9. Vérification systématique des invariants (fail-fast) ---
+    verify_invariants(state, result)
+
+    return result
+    
+
+# ─── TEMPORAL METRICS ENGINE ─────────────────────────────────
+
+def compute_temporal_metrics(metrics: dict) -> dict:
+    """
+    Calcule les métriques nécessitant un historique.
+
+    Cette fonction constitue le point d'entrée unique pour toutes
+    les métriques temporelles.
+
+    Pour RN-006, aucune métrique temporelle n'est encore calculée.
+    Le dictionnaire est donc retourné inchangé.
+
+    Les futures RN ajouteront notamment :
+        - trades_per_day
+        - profit_per_trade
+        - grid_throughput
+        - wallet_growth
+        - inventory_turnover
+        - ...
+    """
+    return metrics
+
+# ─── PRODUCTION DU CONTRAT JSON ─────────────────────────────
+def build_audit_metrics(exchange_name: str, pairs_metrics: dict) -> dict:
+    """Construit le dictionnaire final conforme au contrat V1.1."""
+    return {
+        "schema_version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "exchange": exchange_name,
+        "pairs": pairs_metrics,
+    }
+
+def write_audit_json(data: dict, exchange_key: str):
+    """Écrit le fichier audit_metrics_{exchange}.json."""
+    filename = f"audit_metrics_{exchange_key}.json"
+    tmp = filename + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, filename)
+        logger.info(f"✅ Métriques écrites dans {filename}")
+    except Exception as e:
+        logger.error(f"❌ Erreur d'écriture de {filename} : {e}")
+
+# ─── MAIN ─────────────────────────────────────────────────────
 def parse_args():
-    parser = argparse.ArgumentParser(description="Audit PnL Grid Bot — Binance")
-    parser.add_argument(
-        "--reset-cache",
-        action="store_true",
-        help="Supprime le cache PnL et force un re-scan complet depuis T0"
+    parser = argparse.ArgumentParser(
+        description="Analyse des métriques des bots pour Portfolio Manager (V1.3)"
     )
+    parser.add_argument("--exchange", default=DEFAULT_EXCHANGE,
+                        help=f"Exchange (défaut: {DEFAULT_EXCHANGE})")
+    parser.add_argument("--quote", default=None, choices=SUPPORTED_QUOTES,
+                        help="Quote asset (défaut: détection auto)")
     return parser.parse_args()
 
-if __name__ == "__main__":
+def main():
     setup_logging()
     args = parse_args()
 
-    if args.reset_cache:
-        reset_pnl_cache()
+    logger.info(f"=== Analyse des métriques (exchange={args.exchange}) ===")
 
     try:
-        client   = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_API_SECRET"))
-        snapshot = get_snapshot()
-        # On récupère les soldes cash avant run_audit pour les utiliser dans les calculs de F0
-        cash_free, cash_locked, cash_actuel = get_cash_balance(client)
-        # On injecte ces valeurs dans snapshot pour run_audit ? Non, on les passera via closure ou on les recalcule.
-        # Pour simplifier, on modifie run_audit pour qu'il utilise get_cash_balance directement.
-        # Mais run_audit utilise déjà get_cash_balance interne. Il faut le définir avant.
-        # En fait, run_audit appelle get_cash_balance, mais il n'est pas encore défini.
-        # Correction : déplacer la définition de get_cash_balance avant run_audit.
-        # Je réorganise dans le code final.
-        result = run_audit(client, snapshot)
-        print_report(result)
-        export_metrics_json(result)
-    except FileNotFoundError as e:
-        logger.error(f"Fichier manquant : {e}")
-        sys.exit(1)
-    except ValueError as e:
-        logger.error(f"Données invalides : {e}")
-        sys.exit(1)
-    except (BinanceAPIException, BinanceRequestException) as e:
-        logger.error(f"Erreur API Binance : {e}")
-        sys.exit(1)
+        exchange = create_exchange(args.exchange)
     except Exception as e:
-        logger.exception(f"Erreur inattendue : {e}")
+        logger.error(f"❌ Échec de création de l'exchange : {e}")
         sys.exit(1)
+
+    ekey = exchange_key(exchange)
+
+    # ---- Détection des bots actifs ----
+    bots_info = detect_active_bots(ekey, args.exchange, args.quote)
+
+    if bots_info:
+        symbols = list(bots_info.keys())
+        logger.info(f"Bots actifs détectés via lock : {', '.join(symbols)}")
+        # Pour compatibilité, on transforme en dictionnaire {symbole: state_file}
+        bots = {sym: info["state_file"] for sym, info in bots_info.items()}
+    else:
+        logger.warning("Aucun lock valide trouvé → fallback sur les fichiers state.")
+        bots = detect_bots(ekey, args.quote)
+        if bots:
+            logger.info(f"Bots détectés via state (fallback) : {', '.join(bots.keys())}")
+        else:
+            logger.error("Aucun bot détecté. Vérifiez les fichiers lock ou state.")
+            sys.exit(1)
+
+    pairs_metrics = {}
+
+    for symbol, info in bots_info.items():
+        logger.info(
+            f"Traitement de {symbol} "
+            f"(PID={info['pid']}, lock={info['lock_file']})..."
+        )
+
+        state = load_state(info["state_file"])
+
+        try:
+            price = exchange.get_ticker_price(symbol)
+            if price is None:
+                logger.warning(f"Prix introuvable pour {symbol}, ignoré.")
+                continue
+        except Exception as e:
+            logger.error(f"Erreur lors de l'obtention du prix pour {symbol} : {e}")
+            continue
+
+        try:
+            metrics = compute_metrics(state, price, symbol, args.exchange)
+            metrics = compute_temporal_metrics(metrics)
+            pairs_metrics[symbol] = metrics
+        except RuntimeError as e:
+            logger.error(f"Invariant violé pour {symbol} : {e}")
+            # On ignore ce bot mais on continue avec les autres
+            continue
+
+    if not pairs_metrics:
+        logger.error("Aucune métrique calculée pour un bot valide.")
+        sys.exit(1)
+
+    audit_data = build_audit_metrics(args.exchange, pairs_metrics)
+    write_audit_json(audit_data, ekey)
+
+    logger.info("✅ Analyse terminée.")
+
+if __name__ == "__main__":
+    main()

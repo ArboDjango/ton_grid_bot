@@ -1,3 +1,11 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
 # Logs
 *.log
 *.log.*
@@ -34,3 +42,25 @@ venv/
 # Sauvegardes
 *.bak
 *.disabled
+backup_v36/
+*.save
+*.old
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# États des bots
+state_*.json
+probation_state.json
+pnl_cache.json
+
+# Journaux
+journal_*.jsonl
+*.log
+
+# Rapports
+audit_metrics.json
+portfolio_report.html
+rapport_audit.html

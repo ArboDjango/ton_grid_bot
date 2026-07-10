@@ -2,16 +2,18 @@
 exchange_base.py
 
 Interface abstraite pour les connexions d'exchange.
-Permet de basculer entre Binance, Coinbase ou OKX
+Permet de basculer entre Binance, Coinbase ou Gate.io
 sans modifier la logique métier du bot.
 
-Version : 1.0
+Version : 1.1
 """
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import pandas as pd
+
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -38,7 +40,7 @@ class OrderResult:
 
     Retourné par : create_limit_order, create_market_order, get_order.
     """
-    order_id:      str | int  # int sur Binance, str sur Coinbase/OKX
+    order_id:      str | int  # int sur Binance, str sur Coinbase/Gate.io
     status:        str         # voir constantes STATUS_* de l'exchange
     executed_qty:  float       # quantité exécutée en base asset
     cum_quote_qty: float       # montant total exécuté en quote asset
@@ -61,6 +63,20 @@ class OrderResult:
         return self.status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED")
 
 
+@dataclass
+class TradeResult:
+    """
+    Trade exécuté (historique).
+
+    Utilisé par audit.py pour reconstruire le PnL.
+    """
+    trade_id: int | str
+    is_buyer: bool
+    quote_qty: float
+    commission: float
+    commission_asset: str
+    timestamp: int    # epoch ms
+
 # ══════════════════════════════════════════════════════════════════
 # INTERFACE ABSTRAITE
 # ══════════════════════════════════════════════════════════════════
@@ -70,7 +86,7 @@ class ExchangeBase(ABC):
     Interface commune pour tous les exchanges supportés.
 
     Chaque exchange implémente cette classe et fournit :
-    - Méthodes REST : prix, ordres, soldes, klines
+    - Méthodes REST : prix, ordres, soldes, klines, historique de trades
     - Constantes de protocole : côtés, types d'ordres, statuts
     - Helpers WebSocket : URL du stream, parsing des messages
 
@@ -91,12 +107,15 @@ class ExchangeBase(ABC):
             print(f"Exécuté à {result.avg_price:.4f}")
 
     ── Ajouter un nouvel exchange ───────────────────────────────────
-        1. Créer exchange_coinbase.py (ou exchange_okx.py)
+        1. Créer exchange_gateio.py (ou exchange_okx.py)
         2. Implémenter ExchangeBase
         3. Overrider les constantes de classe si elles diffèrent
         4. Changer la ligne d'instanciation dans le bot :
-               exchange = ExchangeCoinbase()
+               exchange = ExchangeGateIO()
     """
+
+    NAME = "Base"
+    DEFAULT_QUOTE = "USDC"
 
     # ── Constantes de protocole ──────────────────────────────────
     # Valeurs par défaut (standard industrie / compatibles Binance).
@@ -204,14 +223,35 @@ class ExchangeBase(ABC):
         symbol: str,
         side:   str,
         qty:    float,
+        reference_price: float | None = None,
     ) -> OrderResult:
         """
         Crée un ordre marché.
-        L'OrderResult.avg_price doit être calculé (cum_quote_qty / executed_qty).
+
+        qty représente TOUJOURS une quantité de l'actif de base.
+
+        Certains exchanges (ex: Gate.io) peuvent utiliser
+        reference_price pour convertir cette quantité en montant
+        de devise de cotation lors d'un MARKET BUY.
+
+        L'OrderResult.avg_price doit être calculé
+        (cum_quote_qty / executed_qty).
         """
         ...
 
     # ── Soldes ───────────────────────────────────────────────────
+
+    @abstractmethod
+    def get_balance(self, asset: str) -> float:
+        """Retourne le solde disponible (free) de l'actif donné."""
+        ...
+
+    @abstractmethod
+    def get_quote_balance(self) -> float:
+        """
+        Retourne le solde libre de la devise de cotation par défaut
+        (USDT pour Gate.io, USDC pour Binance, etc.).
+        """
 
     @abstractmethod
     def get_balances(
@@ -228,6 +268,33 @@ class ExchangeBase(ABC):
     @abstractmethod
     def invalidate_balance_cache(self) -> None:
         """Force le prochain get_balances() à aller chercher en live sur l'API."""
+        ...
+    
+    
+    # ── Historique de trades ─────────────────────────────────────
+
+    @abstractmethod
+    def get_my_trades(
+        self,
+        symbol: str,
+        from_id: str | int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """
+        Historique des trades utilisateur.
+
+        Retour normalisé :
+
+            trade_id
+            order_id
+            price
+            qty
+            quote_qty
+            commission
+            commission_asset
+            is_buyer
+            timestamp
+        """
         ...
 
     # ── WebSocket ────────────────────────────────────────────────

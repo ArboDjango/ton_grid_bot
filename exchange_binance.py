@@ -49,7 +49,10 @@ class ExchangeBinance(ExchangeBase):
     Les credentials sont lus depuis les variables d'environnement :
         BINANCE_API_KEY, BINANCE_API_SECRET
     """
-
+    
+    NAME = "Binance"
+    DEFAULT_QUOTE = "USDC"
+    
     # ── Constantes Binance (override des défauts de ExchangeBase) ─
     SIDE_BUY  = Client.SIDE_BUY    # "BUY"
     SIDE_SELL = Client.SIDE_SELL   # "SELL"
@@ -199,6 +202,7 @@ class ExchangeBinance(ExchangeBase):
         symbol: str,
         side:   str,
         qty:    float,
+        reference_price: float | None = None,
     ) -> OrderResult:
         raw = self._client.create_order(
             symbol=symbol,
@@ -321,3 +325,35 @@ def get_real_balances(
 def invalidate_balance_cache() -> None:
     """Rétrocompatibilité : délègue à ExchangeBinance.invalidate_balance_cache()."""
     _get_default().invalidate_balance_cache()
+
+
+#----------Multi-echangeurs----------------
+
+def get_balance(self, asset: str) -> float:
+    """Solde disponible (free) pour l'actif."""
+    bal = self._client.get_asset_balance(asset=asset)
+    return float(bal["free"])
+
+def get_my_trades(self, symbol: str, from_id: int | None = None,
+                  start_time: int | None = None, limit: int = 1000) -> list[dict]:
+    """
+    Récupère les trades et les normalise.
+    """
+    kwargs = {"symbol": symbol, "limit": limit}
+    if from_id is not None:
+        kwargs["fromId"] = from_id
+    if start_time is not None:
+        kwargs["startTime"] = start_time
+
+    raw = self._client.get_my_trades(**kwargs)
+    # Normalisation des champs
+    normalized = []
+    for t in raw:
+        normalized.append({
+            "id":              t["id"],
+            "quoteQty":        float(t["quoteQty"]),
+            "commission":      float(t["commission"]),
+            "commissionAsset": t["commissionAsset"],
+            "isBuyer":         t["isBuyer"],
+        })
+    return normalized

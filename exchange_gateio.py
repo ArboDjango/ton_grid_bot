@@ -63,6 +63,7 @@ class ExchangeGateIO(ExchangeBase):
     """
 
     NAME = "Gate.io"
+    DEFAULT_QUOTE = "USDT"
 
     # ── Constantes Gate.io (override de ExchangeBase) ────────────
     SIDE_BUY  = "buy"
@@ -338,22 +339,31 @@ class ExchangeGateIO(ExchangeBase):
         symbol: str,
         side:   str,
         qty:    float,
+        reference_price: float | None = None,
     ) -> OrderResult:
         """
         Crée un ordre marché.
 
         Valide min_qty localement (pas de prix connu → min_notional non vérifiable).
-        Gate.io retourne filled_amount et filled_total directement dans la réponse
-        de création. Un re-fetch défensif est effectué si executed_qty est absent
+        Le moteur reste exprimé en quantité d'actif. La conversion en devise de cotation est spécifique à Gate.io et est effectuée ici. Un re-fetch défensif est effectué si executed_qty est absent
         (race condition réseau rare).
         """
         info = self.get_symbol_info(symbol)
         self._validate_order(symbol, qty, info)  # price=None → skip min_notional
 
+        # Conversion spécifique Gate.io
+        if side == self.SIDE_BUY:
+            if reference_price is None:
+                raise ValueError("reference_price requis pour MARKET BUY Gate.io")
+
+            amount = qty * reference_price      # qty (FIL) -> USDT
+        else:
+            amount = qty                        # qty reste en FIL
+
         order = gate_api.Order(
             currency_pair = self._symbol(symbol),
             side          = side,
-            amount        = f"{qty:.{info.qty_decimals}f}",
+            amount=f"{amount:.8f}",
             type          = "market",
             time_in_force = "ioc",
         )
@@ -374,8 +384,87 @@ class ExchangeGateIO(ExchangeBase):
 
         return result
 
-    # ── Soldes ───────────────────────────────────────────────────
+    #----
+    def get_my_trades(
+        self,
+        symbol: str,
+        *,
+        start_time: int | None = None,
+        from_id: str | int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """
+        Historique des exécutions, format normalisé.
 
+        Retour :
+            [{
+                "trade_id": int,
+                "order_id": str,
+                "price": float,
+                "qty": float,
+                "quote_qty": float,
+                "commission": float,
+                "commission_asset": str,
+                "is_buyer": bool,
+                "timestamp": int,
+            }, ...]
+        """
+        pair = self._symbol(symbol)
+
+        trades = self._spot.list_my_trades(
+            currency_pair=pair,
+            limit=min(limit, 1000),
+        )
+
+        out = []
+
+        for t in trades:
+            
+            ts = int(float(t.create_time_ms))
+            trade_id = int(t.id)
+            
+            if start_time is not None and ts < start_time:
+                continue
+
+            # Compatible avec la logique Binance
+            if from_id is not None and trade_id < int(from_id):
+                continue
+
+            qty = float(t.amount)
+            price = float(t.price)
+
+            out.append({
+                "id": trade_id,
+                "order_id": str(t.order_id),
+                "price": price,
+                "qty": qty,
+                "quoteQty": qty * price,
+                "commission": float(t.fee),
+                "commissionAsset": t.fee_currency,
+                "isBuyer": t.side == "buy",
+                "time": ts,
+            })
+
+        out.sort(key=lambda x: x["id"])
+
+        return out
+    
+    # ── Soldes ───────────────────────────────────────────────────
+    
+    def get_balance(self, asset: str) -> float:
+        """
+        Retourne le solde disponible (free) d'un actif.
+        """
+        try:
+            accounts = self._spot.list_spot_accounts()
+            for a in accounts:
+                if a.currency.upper() == asset.upper():
+                    return float(a.available)
+            return 0.0
+        except Exception:
+            logger.exception(f"❌ Erreur récupération solde {asset}")
+            return 0.0
+    
     def get_balances(
         self,
         quote_asset: str,
@@ -406,9 +495,14 @@ class ExchangeGateIO(ExchangeBase):
     def invalidate_balance_cache(self) -> None:
         """Force le prochain get_balances() à aller chercher en live sur l'API."""
         self._balance_cache["timestamp"] = 0.0
+        
+        
+    def get_quote_balance(self) -> float:
+        return self.get_balance("USDT")
 
     # ── WebSocket ────────────────────────────────────────────────
 
+        
     def get_ws_stream_url(self, symbol: str) -> str:
         """
         Gate.io utilise un endpoint WebSocket unique pour toutes les paires.
@@ -423,6 +517,15 @@ class ExchangeGateIO(ExchangeBase):
             }
         """
         return "wss://api.gateio.ws/ws/v4/"
+        
+        
+    def get_ws_subscribe_message(self, symbol: str) -> dict:
+        return {
+            "time": int(time.time()),
+            "channel": "spot.trades",
+            "event": "subscribe",
+            "payload": [self._symbol(symbol)],
+        }
 
     def parse_ws_trade_price(self, raw_message: str) -> float | None:
         """
