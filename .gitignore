@@ -64,3 +64,30 @@ journal_*.jsonl
 audit_metrics.json
 portfolio_report.html
 rapport_audit.html
+
+# Runtime history
+history/
+*.jsonl
+
+# Runtime states
+control_*.json
+audit_metrics*.json
+
+# Journaux
+journal_*.jsonl
+
+# États temporaires
+snapshot_*.json
+
+# CSV de suivi
+suivi_capital.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Sauvegardes et verrous RN-016
+*.bak1
+*.bak2
+*.bak3
+*.state.lock

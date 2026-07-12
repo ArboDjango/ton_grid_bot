@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+from process_synchronization import AtomicJsonStateStore, BotLock
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +51,8 @@ class BotDescriptor:
             return None
         try:
             content = self.lock_file.read_text().strip()
-            match = re.search(r'^(\d+)', content)
-            if match:
-                return int(match.group(1))
-            return None
-        except (ValueError, OSError):
+            return int(json.loads(content)["pid"])
+        except (ValueError, OSError, KeyError, json.JSONDecodeError):
             return None
 
     @property
@@ -261,8 +259,9 @@ class BotManager:
     # ---------------------------------------------------------------------
 
     def get_budget(self, descriptor: BotDescriptor) -> float:
-        with descriptor.state_file.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = AtomicJsonStateStore(descriptor.state_file).read()
+        if data is None:
+            raise OSError(f"State illisible : {descriptor.state_file}")
         budget = data.get("capital_usdc")
         if budget is None:
             raise KeyError(f"capital_usdc manquant dans {descriptor.state_file}")
@@ -277,28 +276,15 @@ class BotManager:
             f"Mise à jour du budget de {descriptor.symbol} : {new_budget:.2f} USDT"
         )
 
-        with descriptor.state_file.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        data["capital_usdc"] = new_budget
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=self.state_dir,
-            prefix=".tmp_",
-            suffix=".json",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            json.dump(data, tmp, indent=2, ensure_ascii=False)
-            tmp_path = Path(tmp.name)
-
-        try:
-            os.replace(tmp_path, descriptor.state_file)
-        except Exception as e:
-            if tmp_path.exists():
-                tmp_path.unlink()
-            raise OSError(f"Échec du remplacement atomique : {e}")
+        # Même lock que le bot : aucune mise à jour manuelle ne peut écraser
+        # un state maintenu par une instance active.
+        with BotLock(descriptor.lock_file, timeout=10.0, version="BotManager"):
+            store = AtomicJsonStateStore(descriptor.state_file)
+            data = store.read()
+            if data is None:
+                raise OSError(f"State illisible : {descriptor.state_file}")
+            data["capital_usdc"] = new_budget
+            store.write(data)
 
         self.logger.info(f"Budget mis à jour avec succès pour {descriptor.symbol}")
 

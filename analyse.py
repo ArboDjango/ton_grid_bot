@@ -58,6 +58,7 @@ except ImportError:
 
 # ─── IMPORT INVENTORY MANAGER ────────────────────────────────
 import inventory_manager as inv_mgr
+from process_synchronization import AtomicJsonStateStore
 
 # ─── CONSTANTES ──────────────────────────────────────────────
 DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "gateio").lower()
@@ -136,11 +137,8 @@ def is_lock_valid(lock_path: str) -> bool:
     try:
         with open(lock_path, "r") as f:
             content = f.read().strip()
-        parts = content.split(":")
-        if len(parts) != 2:
-            return False
-        pid = int(parts[0])
-        # timestamp = int(parts[1])  # conservé mais non utilisé
+        metadata = json.loads(content)
+        pid = int(metadata["pid"])
 
         # Vérifier si le processus est toujours en vie
         try:
@@ -190,8 +188,7 @@ def detect_active_bots(exchange_key: str, exchange_name: str, quote: str = None)
         # Lire le contenu du lock pour récupérer le PID
         try:
             with open(lock_path, "r") as f:
-                parts = f.read().strip().split(":")
-            pid = int(parts[0]) if len(parts) >= 1 else None
+                pid = int(json.load(f)["pid"])
         except Exception:
             pid = None
 
@@ -230,8 +227,9 @@ def load_state(state_file: str) -> dict:
         logger.warning(f"Fichier state introuvable : {state_file}")
         return defaults
     try:
-        with open(state_file, "r") as f:
-            data = json.load(f)
+        data = AtomicJsonStateStore(state_file).read()
+        if data is None:
+            raise ValueError("state principal et sauvegardes illisibles")
         for k, v in defaults.items():
             data.setdefault(k, v)
         return data

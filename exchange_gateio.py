@@ -240,7 +240,9 @@ class ExchangeGateIO(ExchangeBase):
         return [
             {
                 "order_id":     o.id,
-                "side":         o.side,
+                # ExchangeBase impose BUY/SELL, indépendamment du protocole
+                # interne Gate.io (buy/sell).
+                "side":         str(o.side).upper(),
                 "orig_qty":     float(o.amount       or 0),
                 "executed_qty": float(o.filled_amount or 0),
                 "price":        float(o.price         or 0),

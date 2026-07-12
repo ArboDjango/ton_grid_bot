@@ -9,8 +9,11 @@ et le faire converger progressivement vers la cible.
 import json
 import os
 import time
+import logging
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 class CapitalTargetController:
     """
@@ -43,7 +46,6 @@ class CapitalTargetController:
         self.current_target: Optional[float] = None
         self.last_read_time: float = 0.0
         self.capital_ratio: float = 1.0
-        self._last_log_time: float = 0.0
 
     def _read_control_file(self) -> Optional[float]:
         """Lit le fichier de contrôle et retourne capital_target, ou None."""
@@ -74,6 +76,8 @@ class CapitalTargetController:
             self.last_read_time = now
             target = self._read_control_file()
             if target is not None and target > 0:
+                if self.current_target != target:
+                    logger.info("🎯 Nouvelle cible de capital reçue : %.2f", target)
                 self.current_target = target
 
         # Si pas de cible, on ne touche pas au ratio
@@ -92,11 +96,14 @@ class CapitalTargetController:
         # Reclamp
         self.capital_ratio = max(self.min_ratio, min(self.max_ratio, self.capital_ratio))
 
-        # Log périodique
-        if now - self._last_log_time > 60.0:
-            self._last_log_time = now
-            if abs(self.capital_ratio - 1.0) > 0.001:
-                print(f"🔁 CapitalTarget: ratio={self.capital_ratio:.3f} (cible={self.current_target:.2f}, actuel={current_capital:.2f})")
+        # Les ajustements réguliers ne sont utiles qu'en diagnostic : aucun
+        # message INFO périodique ne doit masquer les événements de démarrage.
+        if abs(step) > 1e-12:
+            logger.debug(
+                "CapitalTarget ratio ajusté : %.3f -> %.3f (cible=%.2f, actuel=%.2f)",
+                self.capital_ratio - step, self.capital_ratio,
+                self.current_target, current_capital,
+            )
 
     def get_ratio(self) -> float:
         """Retourne le ratio d'ajustement actuel."""

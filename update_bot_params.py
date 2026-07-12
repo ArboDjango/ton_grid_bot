@@ -20,7 +20,7 @@ try:
 except ImportError as e:
     print(f"❌ ERREUR: Impossible d'importer 'calibrate' depuis script_atr.py")
     print(f"   Détail: {e}")
-    print("   Assurez-vous que script_atr.py existe et contient une fonction calibrate(symbol).")
+    print("   Assurez-vous que script_atr.py existe et contient calibrate(exchange, symbol).")
     print("   Et que les dépendances (pandas, numpy, ta, python-binance) sont installées.")
     sys.exit(1)
 
@@ -200,6 +200,8 @@ def main():
     args = parser.parse_args()
 
     setup_logging()
+    from exchange_gateio import ExchangeGateIO
+    exchange = ExchangeGateIO()
     logger.info("=== Début calibration paramètres ===")
 
     pairs = [args.pair.upper()] if args.pair else BOTS.keys()
@@ -211,7 +213,7 @@ def main():
         cfg = BOTS[pair]
         logger.info(f"\n--- Traitement de {pair} ({cfg['symbol']}) ---")
         try:
-            new = calibrate(cfg['symbol'])
+            new = calibrate(exchange, cfg['symbol'])
             if "k_max" not in new:
                 new["k_max"] = 1.0
         except Exception as e:

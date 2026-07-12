@@ -22,12 +22,20 @@ from exchange_base import OrderResult
 from exchange_gateio import ExchangeGateIO
 
 from inventory_utils import verify_and_resync_inventory_cost
+from order_reconciliation import reconcile_open_orders as reconcile_normalized_orders
+from calibration_safety import (
+    apply_calibration_atomically,
+    run_calibration,
+)
+from startup_sequence import StartupSequence
+from process_synchronization import AtomicJsonStateStore, BotLock, LockUnavailableError
 
 # ========== RN-011 : import du contrôleur de capital cible ==========
 from capital_target import CapitalTargetController
 
 
-exchange = ExchangeGateIO()
+# L'instance est créée après le chargement de la configuration et du logging.
+exchange = None
 
 try:
     import websocket
@@ -140,7 +148,7 @@ NU_MAX = 8
 NL_MIN = 2
 NL_MAX = 8
 
-KLINE_INTERVAL = exchange.KLINE_3M
+KLINE_INTERVAL = ExchangeGateIO.KLINE_3M
 KLINE_LIMIT = 100
 
 SLIPPAGE_EMA_ALPHA = 0.20
@@ -175,6 +183,7 @@ LOOP_SLEEP      = 0.2
 INDICATORS_FREQ = 60
 ADX_TREND_LIMIT = 50
 STATE_FILE = f"state_gateio_{SYMBOL.lower()}.json"
+STATE_STORE = AtomicJsonStateStore(STATE_FILE)
 JOURNAL_FILE = f"journal_gateio_{SYMBOL.lower()}.jsonl"
 SNAPSHOT_FILE   = "snapshot_gateio_t0.json"
 SNAPSHOT_META_KEYS = {"date_reference", "timestamp_reference", "exchange", "cash_reel_t0"}
@@ -184,7 +193,7 @@ GLOBAL_STOP_LOSS_DD = 0.25
 GLOBAL_STOP_LOSS_PNL = -0.10
 DRAWDOWN_WARNING_THRESHOLD = 0.30
 
-LOCK_TIMEOUT = 120
+LOCK_ACQUIRE_TIMEOUT = 10.0
 WS_PRICE_MAX_AGE  = 20.0
 WS_CHECK_INTERVAL = 60
 WS_FORCE_RESTART_AGE = 60.0
@@ -206,6 +215,7 @@ ws_price      = None
 ws_price_time = 0.0
 ws_price_lock = threading.Lock()
 ws_running    = False
+ws_connecting = False
 ws_thread     = None
 ws_app        = None
 
@@ -238,6 +248,9 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Connexion Exchange : étape explicite du démarrage, après configuration.
+exchange = ExchangeGateIO()
 
 # ── Classe SortedGrid ─────────────────────────────────────────
 class SortedGrid:
@@ -439,29 +452,45 @@ class TradeJournal:
 def get_lock_file(symbol: str) -> str:
     return f"lock_{symbol.lower()}.pid"
 
-def _write_lock_file(symbol: str, action: str = "écrire") -> bool:
-    lock_path = get_lock_file(symbol)
-    try:
-        with open(lock_path, "w") as f:
-            f.write(f"{os.getpid()}:{int(time.time())}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Impossible de {action} le lock {lock_path} : {e}")
-        return False
+bot_process_lock = None
 
 def create_lock(symbol: str) -> bool:
-    return _write_lock_file(symbol, "créer")
+    """Acquiert le flock exclusif du symbole avec un délai borné."""
+    global bot_process_lock
+    if bot_process_lock is not None and bot_process_lock.held:
+        return True
+    try:
+        bot_process_lock = BotLock(
+            get_lock_file(symbol), timeout=LOCK_ACQUIRE_TIMEOUT, version=BOT_VERSION
+        )
+        bot_process_lock.acquire()
+        logger.info(f"🔒 Verrou inter-processus acquis pour {symbol}")
+        return True
+    except LockUnavailableError as e:
+        logger.error(f"❌ Impossible d'acquérir le verrou de {symbol} : {e}")
+        bot_process_lock = None
+        return False
+    except Exception as e:
+        logger.exception(f"❌ Erreur verrou inter-processus {symbol} : {e}")
+        bot_process_lock = None
+        return False
 
 def update_lock(symbol: str) -> bool:
-    return _write_lock_file(symbol, "mettre à jour")
+    if bot_process_lock is None or not bot_process_lock.held:
+        return False
+    try:
+        bot_process_lock.refresh_metadata()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Erreur actualisation métadonnées lock {symbol} : {e}")
+        return False
 
 def remove_lock(symbol: str):
-    lock_path = get_lock_file(symbol)
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception as e:
-        logger.error(f"❌ Erreur suppression lock {lock_path} : {e}")
+    global bot_process_lock
+    if bot_process_lock is not None:
+        bot_process_lock.release()
+        bot_process_lock = None
+        logger.info(f"🔓 Verrou inter-processus libéré pour {symbol}")
 
 def is_process_alive(pid: int) -> bool:
     try:
@@ -474,38 +503,24 @@ def detect_nb_bots() -> int:
     lock_files = glob.glob("lock_*.pid")
     active_bots = 0
     current_pid = os.getpid()
-    current_time = int(time.time())
-
     for lock_path in lock_files:
         try:
             with open(lock_path, "r") as f:
                 content = f.read().strip()
-            parts = content.split(":")
-            if len(parts) != 2:
+            metadata = json.loads(content)
+            pid = int(metadata["pid"])
+            if pid <= 0:
                 logger.warning(f"⚠️ Lock invalide (format): {lock_path}")
                 continue
-            pid = int(parts[0])
-            timestamp = int(parts[1])
 
             if pid == current_pid:
                 active_bots += 1
                 continue
 
             if is_process_alive(pid):
-                if current_time - timestamp > LOCK_TIMEOUT:
-                    logger.warning(f"⚠️ Lock {lock_path} : PID {pid} toujours actif mais timestamp trop vieux ({(current_time - timestamp)}s) -> nettoyage")
-                    os.remove(lock_path)
-                else:
-                    active_bots += 1
-            else:
-                logger.info(f"🧹 Lock obsolète supprimé: {lock_path} (PID {pid} mort)")
-                os.remove(lock_path)
+                active_bots += 1
         except Exception as e:
             logger.error(f"❌ Erreur lecture lock {lock_path} : {e}")
-            try:
-                os.remove(lock_path)
-            except:
-                pass
 
     return max(1, active_bots)
 
@@ -535,11 +550,14 @@ if NB_BOTS is None:
     NB_BOTS = get_snapshot_bot_count()
     logger.info(f"🤖 {NB_BOTS} bot(s) actif(s) détecté(s) (fichiers lock)")
 else:
-    create_lock(SYMBOL)
+    if not create_lock(SYMBOL):
+        logger.error("❌ Échec de création du lock, arrêt.")
+        sys.exit(1)
     logger.info(f"🤖 Partage forcé : {NB_BOTS} bot(s) (argument --bots)")
 
 
 _shutdown_requested = False
+_startup_ready = False
 
 def _handle_signal(sig, frame):
     global _shutdown_requested
@@ -555,15 +573,16 @@ def get_instant_price() -> float | None:
     return exchange.get_ticker_price(SYMBOL)
 
 def start_price_websocket(symbol: str):
-    global ws_price, ws_price_time, ws_running, ws_thread, ws_app, ws_retry_count
+    global ws_price, ws_price_time, ws_running, ws_connecting, ws_thread, ws_app, ws_retry_count
     if not _WS_AVAILABLE:
         logger.warning("⚠️ websocket-client non installé — mode REST uniquement")
         return
-    if ws_running:
+    if ws_running or ws_connecting:
         with _ws_retry_lock:
             ws_retry_count = 0
         return
 
+    ws_connecting = True
     ws_url = exchange.get_ws_stream_url(symbol)
     logger.info(f"🔌 Connexion à {ws_url} (tentative {ws_retry_count+1})")
 
@@ -583,16 +602,19 @@ def start_price_websocket(symbol: str):
             pass
 
     def on_close(ws, close_status_code, close_msg):
-        global ws_running
+        global ws_running, ws_connecting
         if not ws_running:
             return
         ws_running = False
+        ws_connecting = False
         logger.warning("WebSocket fermé")
-        _schedule_ws_reconnect(symbol)
+        if _startup_ready:
+            _schedule_ws_reconnect(symbol)
 
     def on_open(ws):
-        global ws_running, ws_retry_count
+        global ws_running, ws_connecting, ws_retry_count
         ws_running = True
+        ws_connecting = False
         with _ws_retry_lock:
             ws_retry_count = 0
         
@@ -606,7 +628,7 @@ def start_price_websocket(symbol: str):
                                     on_error=on_error,
                                     on_close=on_close)
     def run_ws():
-        global ws_running
+        global ws_running, ws_connecting
 
         try:
             ws_app.run_forever(
@@ -618,15 +640,16 @@ def start_price_websocket(symbol: str):
             logger.warning("⚠️ Thread WebSocket terminé")
 
             ws_running = False
+            ws_connecting = False
 
-            if not _shutdown_requested:
+            if not _shutdown_requested and _startup_ready:
                 _schedule_ws_reconnect(symbol)
                 
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
 
 def stop_price_websocket():
-    global ws_running, ws_app, _ws_reconnect_timer
+    global ws_running, ws_connecting, ws_app, _ws_reconnect_timer
     with _ws_reconnect_lock:
         if _ws_reconnect_timer is not None:
             _ws_reconnect_timer.cancel()
@@ -637,12 +660,13 @@ def stop_price_websocket():
         except Exception as e:
             logger.error(f"Erreur fermeture WS : {e}")
     ws_running = False
+    ws_connecting = False
     logger.info("🛑 WebSocket arrêté")
 
 
 def _schedule_ws_reconnect(symbol: str):
     global _ws_reconnect_timer, ws_retry_count
-    if _shutdown_requested:
+    if _shutdown_requested or not _startup_ready:
         return
     with _ws_reconnect_lock:
         if _ws_reconnect_timer is not None:
@@ -662,7 +686,7 @@ def _ws_do_reconnect(symbol: str):
     global _ws_reconnect_timer
     with _ws_reconnect_lock:
         _ws_reconnect_timer = None
-    if not _shutdown_requested and not ws_running:
+    if _startup_ready and not _shutdown_requested and not ws_running:
         start_price_websocket(symbol)
 
 def get_ws_price() -> float | None:
@@ -894,12 +918,15 @@ def load_state() -> dict:
         "CALIB_REF_ATR_LOW": DENSITY_ATR_LOW,
         "CALIB_REF_ATR_HIGH": DENSITY_ATR_HIGH,
         "CALIB_REF_K_MIN": DENSITY_K_MIN,
-        "last_calibration_time": 0.0,
+         "last_calibration_time": 0.0,
+         # Mémoire persistante des quantités cumulées déjà appliquées pendant
+         # la réconciliation d'ordres. Voir order_reconciliation.py.
+         "reconciled_orders": {},
     }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                state = {**defaults, **json.load(f)}
+    try:
+        persisted_state = STATE_STORE.read()
+        if persisted_state is not None:
+            state = {**defaults, **persisted_state}
             state = migrate_old_state(state)
             
             state, corrected = verify_and_resync_inventory_cost(state)
@@ -920,8 +947,10 @@ def load_state() -> dict:
                 if isinstance(state.get("buy_grid"), list):
                     state["buy_grid"] = SortedGrid(reverse=True, initial=state["buy_grid"])
             return state
-        except Exception as e:
-            logger.warning(f"⚠️ Impossible de lire {STATE_FILE} : {e}")
+        elif os.path.exists(STATE_FILE):
+            logger.warning(f"⚠️ State illisible et aucune sauvegarde exploitable : {STATE_FILE}")
+    except Exception as e:
+        logger.warning(f"⚠️ Impossible de lire {STATE_FILE} : {e}")
     defaults["sell_grid"] = SortedGrid(reverse=False)
     defaults["buy_grid"] = SortedGrid(reverse=True)
     return defaults
@@ -933,11 +962,10 @@ def save_state(state: dict):
         state_copy["sell_grid"] = state_copy["sell_grid"].to_list()
     if isinstance(state_copy.get("buy_grid"), SortedGrid):
         state_copy["buy_grid"] = state_copy["buy_grid"].to_list()
-    tmp = STATE_FILE + ".tmp"
     try:
-        with open(tmp, "w") as f:
-            json.dump(state_copy, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+        if bot_process_lock is None or not bot_process_lock.held:
+            raise RuntimeError("sauvegarde refusée sans verrou inter-processus du bot")
+        STATE_STORE.write(state_copy)
     except Exception as e:
         logger.error(f"❌ Erreur sauvegarde : {e}")
 
@@ -993,39 +1021,36 @@ def reconcile_open_orders(state: dict):
 
                 save_state(state)
 
-            return
+            return True
 
         logger.info(f"🔍 {len(open_orders)} ordre(s) ouvert(s) détecté(s) sur {exchange.NAME}.")
-        for order in open_orders:
-            order_id     = order["orderId"]
-            side         = order["side"]
-            orig_qty     = order["origQty"]
-            executed_qty = order["executedQty"]
-            price        = order["price"]
-            status       = order["status"]
-            if status in ("NEW", "PARTIALLY_FILLED"):
-                if executed_qty > 0:
-                    if side == "BUY":
-                        logger.warning(f"⚠️ Ordre BUY {order_id} partiellement exécuté ({executed_qty} sur {orig_qty}) — ajout inventaire")
-                        inv_mgr.add_buy_lot(
-                            state,
-                            qty=executed_qty,
-                            buy_price=price,
-                            source="open_order_reconcile",
-                            reconciled=True,
-                        )
-                    else:
-                        logger.warning(f"⚠️ Ordre SELL {order_id} partiellement exécuté ({executed_qty} sur {orig_qty}) — retrait inventaire")
-                        inv_mgr.consume_fifo(state, executed_qty)
-                try:
-                    exchange.cancel_order(SYMBOL, order_id)
-                    logger.info(f"🗑️ Ordre {order_id} annulé.")
-                except Exception as e:
-                    logger.error(f"❌ Erreur annulation ordre {order_id} : {e}")
+
+        def cancel_normalized_order(order_id: str | int):
+            exchange.cancel_order(SYMBOL, order_id)
+            logger.info(f"🗑️ Ordre {order_id} annulé.")
+
+        result = reconcile_normalized_orders(
+            state,
+            open_orders,
+            buy_side=exchange.SIDE_BUY,
+            sell_side=exchange.SIDE_SELL,
+            cancel_order=cancel_normalized_order,
+            persist_state=lambda: save_state(state),
+        )
         save_state(state)
-        logger.info("✅ Réconciliation des ordres ouverts terminée.")
+        logger.info(
+            "✅ Réconciliation des ordres ouverts terminée "
+            f"({result['deltas_applied']} delta(s) appliqué(s))."
+        )
+        if result["cancel_failures"]:
+            logger.warning(
+                f"⚠️ {result['cancel_failures']} annulation(s) échouée(s) : "
+                "nouvelle tentative au prochain cycle, sans double réconciliation."
+            )
+        return True
     except Exception as e:
         logger.error(f"❌ Erreur réconciliation des ordres ouverts : {e}")
+        return False
 
 # ═══════════════════════════════════════════════════════════════
 # INDICATEURS ET MATHÉMATIQUES
@@ -1428,11 +1453,7 @@ def try_calibrate_params(state: dict):
     if not _CALIBRATE_AVAILABLE:
         return
     try:
-        new_params = calibrate(exchange, SYMBOL)
-        
-        if not new_params or not all(k in new_params for k in ["atr_low", "atr_high", "k_min", "k_max"]):
-            logger.warning("Calibration : résultat incomplet, ignoré.")
-            return
+        new_params, duration = run_calibration(True, exchange, SYMBOL, calibrate)
 
         ref_low = state.get("CALIB_REF_ATR_LOW", DENSITY_ATR_LOW)
         ref_high = state.get("CALIB_REF_ATR_HIGH", DENSITY_ATR_HIGH)
@@ -1459,22 +1480,23 @@ def try_calibrate_params(state: dict):
                 f"ATR_HIGH={new_params['atr_high']:.4f} (Δ={delta_high:.1%}), "
                 f"K_MIN={new_params['k_min']:.2f} (Δ={delta_kmin:.2f})"
             )
-            state["DENSITY_ATR_LOW"] = new_params["atr_low"]
-            state["DENSITY_ATR_HIGH"] = new_params["atr_high"]
-            state["DENSITY_K_MIN"] = new_params["k_min"]
-            state["DENSITY_K_MAX"] = new_params["k_max"]
-            state["CALIB_REF_ATR_LOW"] = new_params["atr_low"]
-            state["CALIB_REF_ATR_HIGH"] = new_params["atr_high"]
-            state["CALIB_REF_K_MIN"] = new_params["k_min"]
+            apply_calibration_atomically(state, new_params)
             state["grid_ready"] = False
-            logger.info("🔄 Reconstruction de la grille programmée (nouveaux paramètres ATR/K)")
+            logger.info(
+                "✅ Calibration appliquée en "
+                f"{duration:.3f}s ; reconstruction de grille programmée (nouveaux paramètres ATR/K)"
+            )
         else:
             logger.debug(
                 f"Calibration : écarts non significatifs (ATR_LOW={delta_low:.1%}, "
-                f"ATR_HIGH={delta_high:.1%}, K_MIN={delta_kmin:.2f})"
+                f"ATR_HIGH={delta_high:.1%}, K_MIN={delta_kmin:.2f}) ; "
+                f"calibration valide en {duration:.3f}s, paramètres existants conservés"
             )
     except Exception as e:
-        logger.error(f"Erreur calibration périodique : {e}")
+        logger.error(
+            f"❌ Calibration périodique rejetée : {e}. "
+            "Anciens paramètres conservés sans modification."
+        )
 
 # ═══════════════════════════════════════════════════════════════
 # BOUCLE PRINCIPALE
@@ -1482,32 +1504,39 @@ def try_calibrate_params(state: dict):
 
 logger.info(f"🚀 Démarrage Moteur Quantitatif {BOT_VERSION} — Target: {SYMBOL}")
 
-start_price_websocket(SYMBOL)
+startup = StartupSequence()
+startup.configuration_loaded = True
 get_symbol_precisions()
+startup.exchange_connected = True
 state = load_state()
+startup.state_loaded = True
 journal = TradeJournal(SYMBOL)
 
-# ========== RN-011 : initialisation du contrôleur de capital cible ==========
-capital_target_controller = CapitalTargetController(SYMBOL, state_dir=".")
-logger.info("📦 CapitalTargetController initialisé pour convergence dynamique")
+# Le contrôleur est volontairement retardé jusqu'à ce que toutes ses
+# dépendances de démarrage soient satisfaites.
+capital_target_controller = None
 
 # ── Calibration initiale ──────────────────────────────────────
 if _CALIBRATE_AVAILABLE and not state.get("grid_ready"):
     try:
-        init_params = calibrate(SYMBOL)
-        if init_params and all(k in init_params for k in ["atr_low", "atr_high", "k_min", "k_max"]):
-            state["DENSITY_ATR_LOW"] = init_params["atr_low"]
-            state["DENSITY_ATR_HIGH"] = init_params["atr_high"]
-            state["DENSITY_K_MIN"] = init_params["k_min"]
-            state["DENSITY_K_MAX"] = init_params["k_max"]
-            state["CALIB_REF_ATR_LOW"] = init_params["atr_low"]
-            state["CALIB_REF_ATR_HIGH"] = init_params["atr_high"]
-            state["CALIB_REF_K_MIN"] = init_params["k_min"]
-            logger.info(f"📏 Paramètres ATR/K calibrés au démarrage pour {SYMBOL}")
+        init_params, duration = run_calibration(True, exchange, SYMBOL, calibrate)
+        apply_calibration_atomically(state, init_params)
+        save_state(state)
+        logger.info(
+            f"✅ Calibration initiale appliquée pour {SYMBOL} en {duration:.3f}s : "
+            f"ATR=[{init_params['atr_low']:.4f}, {init_params['atr_high']:.4f}], "
+            f"K=[{init_params['k_min']:.2f}, {init_params['k_max']:.2f}]"
+        )
     except Exception as e:
-        logger.warning(f"Échec calibration initiale : {e}")
+        logger.warning(
+            f"❌ Calibration initiale rejetée : {e}. "
+            "Paramètres existants conservés sans modification."
+        )
+else:
+    logger.info("ℹ️ Calibration initiale désactivée ou grille déjà initialisée.")
+startup.calibration_done = True
 
-reconcile_open_orders(state)
+startup.reconciliation_done = reconcile_open_orders(state)
 
 # ── Startup journal ─────────────────────────────────────────
 _capital_for_startup = state.get("capital_usdc", 0.0) or (MAX_BUDGET_USDC or 0.0)
@@ -1535,6 +1564,7 @@ last_log_time         = time.time()
 last_info_log         = time.time()
 last_lock_update      = time.time()
 last_ws_check         = time.time()
+last_startup_ws_attempt = 0.0
 stress                = 0.20
 with _ws_retry_lock:
     ws_retry_count = 0
@@ -1556,7 +1586,7 @@ while not _shutdown_requested:
             )
             time.sleep(backoff)
 
-        if time.time() - last_ws_check >= WS_CHECK_INTERVAL:
+        if _startup_ready and time.time() - last_ws_check >= WS_CHECK_INTERVAL:
             last_ws_check = time.time()
             with ws_price_lock:
                 age = time.time() - ws_price_time
@@ -1692,10 +1722,6 @@ while not _shutdown_requested:
             )
             last_exposure_state = current_exposure_state
 
-        # ========== RN-011 : mise à jour du ratio de capital cible ==========
-        capital_target_controller.update(capital_for_grid)
-        capital_ratio = capital_target_controller.get_ratio()
-
         out_of_bounds = state["grid_ready"] and (price < state["Gll"] or price > state["Gul"])
         grid_empty    = state["grid_ready"] and (len(state["sell_grid"])==0 and len(state["buy_grid"])==0)
         must_init = not state["grid_ready"] or out_of_bounds or grid_empty
@@ -1730,6 +1756,36 @@ while not _shutdown_requested:
         if not state["grid_ready"]:
             time.sleep(LOOP_SLEEP)
             continue
+
+        # L'ordre de démarrage est volontairement strict : la grille existe
+        # avant le WebSocket, le WebSocket est connecté avant le contrôleur,
+        # puis seulement les tâches périodiques et le trading démarrent.
+        if not startup.grid_initialized:
+            startup.grid_initialized = True
+            logger.info("✅ Grille initialisée — démarrage de la connexion WebSocket")
+
+        if not ws_running and not ws_connecting and time.time() - last_startup_ws_attempt >= 5.0:
+            last_startup_ws_attempt = time.time()
+            start_price_websocket(SYMBOL)
+
+        if ws_running and capital_target_controller is None and startup.reconciliation_done:
+            capital_target_controller = CapitalTargetController(SYMBOL, state_dir=".")
+            startup.websocket_connected = True
+            startup.capital_target_active = True
+            _startup_ready = startup.ready
+            if _startup_ready:
+                logger.info(startup.ready_report())
+
+        # Aucun traitement périodique ni ordre avant le signal READY. En cas
+        # d'indisponibilité réseau, le bot reste explicitement en initialisation
+        # et réessaie le WebSocket sans créer de Timer de reconnexion.
+        if not _startup_ready:
+            time.sleep(LOOP_SLEEP)
+            continue
+
+        # ========== RN-011 : mise à jour du ratio de capital cible ==========
+        capital_target_controller.update(capital_for_grid)
+        capital_ratio = capital_target_controller.get_ratio()
 
         sell_grid = state["sell_grid"]
         buy_grid = state["buy_grid"]
