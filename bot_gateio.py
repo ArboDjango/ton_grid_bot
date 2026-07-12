@@ -33,6 +33,13 @@ from process_synchronization import AtomicJsonStateStore, BotLock, LockUnavailab
 # ========== RN-011 : import du contrôleur de capital cible ==========
 from capital_target import CapitalTargetController
 
+# ============================================================================
+# RN-105.1 : Import de CapitalView et du builder
+# ============================================================================
+from capital_view import CapitalView, CapitalViewBuilder
+
+from history_logger import HistoryLogger
+
 
 # L'instance est créée après le chargement de la configuration et du logging.
 exchange = None
@@ -1131,6 +1138,9 @@ def compute_gv(capital, P0, Gul, Gll, nu, nl, density_k):
     gv_raw = (capital / denom) * GV_MULTIPLIER if denom > 0 else (capital / (nu+nl)) * GV_MULTIPLIER
     gv_usdc = gv_raw * P0
     return max(MIN_ORDER_USDC, min(gv_usdc, capital * MAX_CELL_RATIO))
+    
+# ── Injection de compute_gv dans CapitalViewBuilder ──────────────────────
+CapitalViewBuilder.compute_gv_fn = compute_gv
 
 def compute_density_k(atr_norm_15m, state):
     atr_low = state.get("DENSITY_ATR_LOW", DENSITY_ATR_LOW)
@@ -1147,6 +1157,52 @@ def compute_min_gap(state):
     min_gap = total_cost * 1.5
     base_min = TRADING_FEE_RT * EQ16_MIN_RATIO
     return max(min_gap, base_min)
+    
+    
+def format_capital_view(view: CapitalView) -> str:
+    """Formate une CapitalView en bloc compact."""
+    lines = []
+    lines.append("═══════════════════════════════════════════════════════════════")
+    lines.append(f"  CapitalView  [{view.symbol}]  @ {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(view.timestamp))}")
+    lines.append("───────────────────────────────────────────────────────────────")
+    lines.append(f"  Wallet        : {view.wallet_balance:>8.2f} USDT")
+    lines.append(f"  Reference     : {view.reference_budget:>8.2f}")
+    lines.append(f"  Grid          : {view.grid_budget:>8.2f}")
+    target_str = f"{view.target_budget:>8.2f}" if view.target_budget is not None else "   None"
+    lines.append(f"  Target        : {target_str}")
+    lines.append(f"  Strategic     : {view.strategic_budget:>8.2f}")
+    lines.append(f"  Ratio         : {view.capital_ratio:>8.3f}")
+    lines.append(f"  BUY Expo      : {view.buy_exposure:>8.2f}")
+    lines.append(f"  SELL Expo     : {view.sell_exposure:>8.2f}")
+    lines.append(f"  BUY Gv        : {view.gv_buy:>8.2f}")
+    lines.append(f"  SELL Gv       : {view.gv_sell:>8.2f}")
+    lines.append(f"  Stress        : {view.stress:>8.3f}")
+    lines.append(f"  ADX           : {view.adx:>6.1f}  [{view.regime}]")
+    lines.append(f"  Ordres ouverts: {view.open_orders:>8d}")
+    lines.append(f"  Capital engagé: {view.engaged_capital:>8.2f}")
+    status_symbol = "🟢" if view.health_status == "HEALTHY" else "🟡" if view.health_status == "WARNING" else "🔴"
+    lines.append(f"  Health        : {status_symbol} {view.health_status}")
+    lines.append("═══════════════════════════════════════════════════════════════")
+    return "\n".join(lines)
+
+def _should_log_info(new_view: CapitalView, prev_view: Optional[CapitalView]) -> bool:
+    if prev_view is None:
+        return True
+    if new_view.target_budget != prev_view.target_budget:
+        if new_view.target_budget is None or prev_view.target_budget is None:
+            return True
+        if abs(new_view.target_budget - prev_view.target_budget) > 0.5:
+            return True
+        if prev_view.target_budget > 0 and abs(new_view.target_budget - prev_view.target_budget) / abs(prev_view.target_budget) > 0.005:
+            return True
+    if abs(new_view.capital_ratio - prev_view.capital_ratio) > 0.02:
+        return True
+    if prev_view.strategic_budget > 0 and abs(new_view.strategic_budget - prev_view.strategic_budget) / abs(prev_view.strategic_budget) > 0.02:
+        return True
+    if new_view.regime != prev_view.regime:
+        return True
+    return False
+
 
 def enforce_eq16(P0, atr, Gul, Gll, nu, nl, stress, gub, glb, density_k, state):
     for attempt in range(EQ16_MAX_RETRIES+1):
@@ -1512,6 +1568,8 @@ state = load_state()
 startup.state_loaded = True
 journal = TradeJournal(SYMBOL)
 
+history_logger = HistoryLogger()
+
 # Le contrôleur est volontairement retardé jusqu'à ce que toutes ses
 # dépendances de démarrage soient satisfaites.
 capital_target_controller = None
@@ -1571,6 +1629,11 @@ with _ws_retry_lock:
 
 failed_consecutive = 0
 last_exposure_state = None
+
+
+_prev_capital_view = None
+_force_log_event = True   # pour forcer un log au démarrage
+
 
 while not _shutdown_requested:
     try:
@@ -1751,6 +1814,7 @@ while not _shutdown_requested:
                 state["last_grid_rebuild_ts"] = time.time()
                 state["last_rebuild_price"] = price
                 save_state(state)
+                _force_log_event = True
             quote_bal, base_bal, total_wallet, capital_for_grid = get_balances(price, state)
 
         if not state["grid_ready"]:
@@ -1963,14 +2027,46 @@ while not _shutdown_requested:
                 f"Ratio CapitalTarget={capital_ratio:.3f}"
             )
 
-            if time.time() - last_info_log >= 300:
-                last_info_log = time.time()
-                logger.info(
-                    f"📊 Résumé {price:.4f} | Wallet={total_wallet:.2f} | PnL total={pnl_pct*100:+.2f}% | "
-                    f"Stock={inventory_qty:.4f} | Trades={state['total_trades']} | Stress={stress:.2f} | "
-                    f"Ratio CapitalTarget={capital_ratio:.3f}"
-                )
+        # ── CAPITALVIEW : construction et log conditionnel ──
+        # (Ne s'exécute qu'en DEBUG, sur événement forcé, ou toutes les 60s)
+        if LOG_LEVEL <= logging.DEBUG or _force_log_event or (time.time() - last_info_log >= 60):
+            # Récupérer les agrégats existants (ne recrée pas de calcul)
+            capital_view_aggregates = compute_capital_view(state, price)
 
+            # Construire la vue
+            view = CapitalViewBuilder.build(
+                symbol=SYMBOL,
+                state=state,
+                price=price,
+                capital_view_aggregates=capital_view_aggregates,
+                capital_target_controller=capital_target_controller,
+                macro_data=macro_data,
+                stress=stress,
+                buy_exposure=buy_exposure_factor,
+                sell_exposure=sell_exposure_factor,
+                regime=regime,
+                grid_sell_len=len(sell_grid),
+                grid_buy_len=len(buy_grid),
+            )
+
+            # Historisation (HistoryLogger)
+            if history_logger:
+                history_logger.log_capital_view(view)
+
+            # Log INFO conditionnel (uniquement si changement significatif ou événement)
+            if LOG_LEVEL <= logging.INFO:
+                if _should_log_info(view, _prev_capital_view) or _force_log_event:
+                    logger.info("\n" + format_capital_view(view))
+                    _prev_capital_view = view
+                    _force_log_event = False
+
+            # En DEBUG, log systématique
+            if LOG_LEVEL <= logging.DEBUG:
+                logger.debug(f"CapitalView (debug): {view}")
+
+            last_info_log = time.time()
+
+        # Fin de la boucle - pause
         time.sleep(LOOP_SLEEP)
 
     except Exception as e:

@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import logging
+from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,21 @@ class HistoryLogger:
             if k not in ("timestamp", "portfolio", "cash"):
                 entry[k] = v
         self._append_jsonl(self.capital_file, entry)
+
+    def log_capital_view(self, view) -> None:
+        """
+        Sérialise directement une CapitalView dans capital_history.jsonl.
+        Aucun recalcul ni transformation n'est effectué.
+        La dataclass est convertie en dict via asdict().
+        """
+        if not view:
+            return
+        try:
+            entry = asdict(view)
+            # S'assurer que le timestamp est présent (il l'est déjà)
+            self._append_jsonl(self.capital_file, entry)
+        except Exception as e:
+            logger.warning(f"⚠️ Échec d'écriture de CapitalView dans history: {e}")
 
     def log_control(self, report: Dict[str, Any]) -> None:
         if not report:
