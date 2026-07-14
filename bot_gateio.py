@@ -1,4 +1,4 @@
-BOT_VERSION = "V107"
+BOT_VERSION = "V108-RN019"
 
 import os
 import sys
@@ -30,18 +30,13 @@ from calibration_safety import (
 from startup_sequence import StartupSequence
 from process_synchronization import AtomicJsonStateStore, BotLock, LockUnavailableError
 
-# ========== RN-011 : import du contrôleur de capital cible ==========
 from capital_target import CapitalTargetController
 
-# ============================================================================
-# RN-105.1 : Import de CapitalView et du builder
-# ============================================================================
 from capital_view import CapitalView, CapitalViewBuilder
 
 from history_logger import HistoryLogger
+history_logger = HistoryLogger()
 
-
-# L'instance est créée après le chargement de la configuration et du logging.
 exchange = None
 
 try:
@@ -50,7 +45,7 @@ try:
 except ImportError:
     websocket = None
     _WS_AVAILABLE = False
-    print("⚠️  'websocket-client' n'est pas installé. Installez-le avec : pip install websocket-client")
+    print("⚠️  'websocket-client' n'est pas installé.")
 
 try:
     from dotenv import load_dotenv
@@ -58,22 +53,17 @@ try:
 except ImportError:
     print("⚠️  Attention: 'python-dotenv' n'est pas installé.")
 
-
-
-# ── Import du calibrateur ATR/K ────────────────────────────────
 try:
     from script_atr import calibrate
     _CALIBRATE_AVAILABLE = True
 except ImportError:
     calibrate = None
     _CALIBRATE_AVAILABLE = False
-    print("⚠️  'script_atr' non trouvé. Calibration périodique désactivée (paramètres fixes).")
+    print("⚠️  'script_atr' non trouvé.")
 
-
-# ── PARSING ─────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Grid Trading Bot — V106 (snapshot = source de vérité, ensure_capital idempotent)",
+        description="Grid Trading Bot — V108 (RN-019 : architecture économique figée)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -89,7 +79,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bots", type=int, default=None,
                         help="Nombre de bots se partageant le capital USDC (détection auto si omis)")
     parser.add_argument("--reconcile", action="store_true",
-                        help="Réconcilier l'inventaire UNIQUEMENT au démarrage (manuel)")
+                        help="Réconcilier l'inventaire et les ordres ouverts (ne modifie pas le capital stratégique)")
+    parser.add_argument("--sync-capital", action="store_true",
+                        help="Recalcule allocated_capital à partir du wallet réel, conserve l'historique (FIFO, PnL, peak)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Niveau de log (défaut: INFO)")
@@ -102,18 +94,20 @@ def parse_args() -> argparse.Namespace:
     ns.max_budget_usdc = raw.n_budget if raw.n_budget is not None else raw._p_budget
     ns.bots            = raw.bots
     ns.reconcile       = raw.reconcile
+    ns.sync_capital    = raw.sync_capital
     ns.log_level       = raw.log_level
     return ns
 
 args = parse_args()
 
 SYMBOL           = args.symbol
+CURRENT_SYMBOL   = args.symbol
 MAX_BUDGET_USDC  = args.max_budget_usdc
 NB_BOTS          = args.bots
 AUTO_RECONCILE   = args.reconcile
+SYNC_CAPITAL     = args.sync_capital
 LOG_LEVEL        = getattr(logging, args.log_level.upper())
 
-# ── Résolution de la paire ────────────────────────────────────
 if SYMBOL.endswith("USDC"):
     BASE_ASSET = SYMBOL[:-4]
     QUOTE_ASSET = "USDC"
@@ -124,26 +118,22 @@ else:
     print(f"❌ Paire {SYMBOL} non supportée.")
     sys.exit(1)
 
-
-# ── Paramètres par défaut (seront écrasés par calibration) ────
+# Paramètres par défaut (écrasés par calibration)
 if SYMBOL == "INJUSDC":
     DENSITY_ATR_LOW  = 0.0070
     DENSITY_ATR_HIGH = 0.0133
     DENSITY_K_MIN    = 0.50
     DENSITY_K_MAX    = 1.00
-
 elif SYMBOL == "EGLDUSDC":
     DENSITY_ATR_LOW  = 0.0032
     DENSITY_ATR_HIGH = 0.0057
     DENSITY_K_MIN    = 0.50
     DENSITY_K_MAX    = 1.00
-
 elif SYMBOL == "FILUSDC":
     DENSITY_ATR_LOW  = 0.0031
     DENSITY_ATR_HIGH = 0.0087
     DENSITY_K_MIN    = 0.60
     DENSITY_K_MAX    = 1.00
-
 else:
     DENSITY_ATR_LOW  = 0.004
     DENSITY_ATR_HIGH = 0.008
@@ -161,8 +151,6 @@ KLINE_LIMIT = 100
 SLIPPAGE_EMA_ALPHA = 0.20
 STRESS_LIMIT_FOR_MAKER = 0.30
 
-
-# ── Constantes ─────────────────────────────────────────────────
 NU_LEVELS = 5
 NL_LEVELS = 5
 
@@ -207,16 +195,18 @@ WS_FORCE_RESTART_AGE = 60.0
 
 FORCE_INIT_TIMEOUT = 600
 
+CAPITAL_CHECK_INTERVAL = 5  # secondes entre les vérifications du state en attente
+
 PRICE_DECIMALS = 4
 QTY_DECIMALS   = 2
 MIN_NOTIONAL = 0.0
 MIN_QTY      = 0.0
 
-# ── Rate limit ─────────────────────────────────────────────────
+METRICS_INTERVAL = 30
+METRICS_MAX_SIZE = 100 * 1024 * 1024
+
 _last_get_order_time = 0.0
 MIN_GET_ORDER_INTERVAL = 1.0
-
-# ── Caches ─────────────────────────────────────────────────────
 
 ws_price      = None
 ws_price_time = 0.0
@@ -231,13 +221,12 @@ _ws_retry_lock  = threading.Lock()
 WS_BACKOFF_BASE = 1.0
 WS_BACKOFF_MAX  = 60.0
 
-_ws_reconnect_timer = None          # threading.Timer de reconnexion en attente
+_ws_reconnect_timer = None
 _ws_reconnect_lock  = threading.Lock()
 
 failed_consecutive = 0
 _capital_initial = None
 
-# ── Logging ───────────────────────────────────────────────────
 log_file = f"bot_{SYMBOL.lower()}.log"
 logging.getLogger().handlers.clear()
 handler = logging.handlers.RotatingFileHandler(
@@ -256,10 +245,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Connexion Exchange : étape explicite du démarrage, après configuration.
 exchange = ExchangeGateIO()
 
-# ── Classe SortedGrid ─────────────────────────────────────────
 class SortedGrid:
     def __init__(self, reverse=False, initial=None):
         self._reverse = reverse
@@ -319,7 +306,6 @@ class SortedGrid:
     def set(self):
         return self._set
 
-# ── Journal des transactions ──────────────────────────────────
 class TradeJournal:
     def __init__(self, symbol: str):
         self.path = JOURNAL_FILE
@@ -454,15 +440,22 @@ class TradeJournal:
         })
         self._write(entry)
 
+    def log_capital_sync(self, old_allocated: float, new_allocated: float, wallet_real: float, reason: str):
+        entry = self._base("CAPITAL_SYNC")
+        entry.update({
+            "old_allocated": round(old_allocated, 2),
+            "new_allocated": round(new_allocated, 2),
+            "wallet_real": round(wallet_real, 2),
+            "reason": reason,
+        })
+        self._write(entry)
 
-# ── Locks ──────────────────────────────────────────────────────
 def get_lock_file(symbol: str) -> str:
     return f"lock_{symbol.lower()}.pid"
 
 bot_process_lock = None
 
 def create_lock(symbol: str) -> bool:
-    """Acquiert le flock exclusif du symbole avec un délai borné."""
     global bot_process_lock
     if bot_process_lock is not None and bot_process_lock.held:
         return True
@@ -519,33 +512,23 @@ def detect_nb_bots() -> int:
             if pid <= 0:
                 logger.warning(f"⚠️ Lock invalide (format): {lock_path}")
                 continue
-
             if pid == current_pid:
                 active_bots += 1
                 continue
-
             if is_process_alive(pid):
                 active_bots += 1
         except Exception as e:
             logger.error(f"❌ Erreur lecture lock {lock_path} : {e}")
-
     return max(1, active_bots)
 
 def get_snapshot_bot_count() -> int:
     if not os.path.exists(SNAPSHOT_FILE):
         return 1
-
     try:
         with open(SNAPSHOT_FILE, "r") as f:
             snap = json.load(f)
-
-        tokens = [
-            k for k, v in snap.items()
-            if isinstance(v, dict) and "stock" in v
-        ]
-
+        tokens = [k for k, v in snap.items() if isinstance(v, dict) and "stock" in v]
         return max(1, len(tokens))
-
     except Exception as e:
         logger.warning(f"⚠️ Impossible de lire {SNAPSHOT_FILE} pour compter les bots : {e}")
         return 1
@@ -562,7 +545,6 @@ else:
         sys.exit(1)
     logger.info(f"🤖 Partage forcé : {NB_BOTS} bot(s) (argument --bots)")
 
-
 _shutdown_requested = False
 _startup_ready = False
 
@@ -571,10 +553,6 @@ def _handle_signal(sig, frame):
     _shutdown_requested = True
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT,  _handle_signal)
-
-# ═══════════════════════════════════════════════════════════════
-# FONCTIONS DE BASE
-# ═══════════════════════════════════════════════════════════════
 
 def get_instant_price() -> float | None:
     return exchange.get_ticker_price(SYMBOL)
@@ -624,9 +602,7 @@ def start_price_websocket(symbol: str):
         ws_connecting = False
         with _ws_retry_lock:
             ws_retry_count = 0
-        
         ws.send(json.dumps(exchange.get_ws_subscribe_message(symbol)))
-        
         logger.info(f"🌐 WebSocket connecté pour {symbol} (stream @trade)")
 
     ws_app = websocket.WebSocketApp(ws_url,
@@ -636,22 +612,18 @@ def start_price_websocket(symbol: str):
                                     on_close=on_close)
     def run_ws():
         global ws_running, ws_connecting
-
         try:
             ws_app.run_forever(
                 ping_interval=20,
                 ping_timeout=10,
             )
-
         finally:
             logger.warning("⚠️ Thread WebSocket terminé")
-
             ws_running = False
             ws_connecting = False
-
             if not _shutdown_requested and _startup_ready:
                 _schedule_ws_reconnect(symbol)
-                
+
     ws_thread = threading.Thread(target=run_ws, daemon=True)
     ws_thread.start()
 
@@ -670,7 +642,6 @@ def stop_price_websocket():
     ws_connecting = False
     logger.info("🛑 WebSocket arrêté")
 
-
 def _schedule_ws_reconnect(symbol: str):
     global _ws_reconnect_timer, ws_retry_count
     if _shutdown_requested or not _startup_ready:
@@ -687,7 +658,6 @@ def _schedule_ws_reconnect(symbol: str):
         t.daemon = True
         t.start()
         _ws_reconnect_timer = t
-
 
 def _ws_do_reconnect(symbol: str):
     global _ws_reconnect_timer
@@ -712,7 +682,6 @@ def get_ws_price() -> float | None:
             return None
     return p
 
-
 def _num(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -733,100 +702,106 @@ def _get_capital_from_snapshot(token: str) -> float | None:
         logger.warning(f"⚠️ Lecture {SNAPSHOT_FILE} impossible pour capital de {token} : {e}")
         return None
 
-# ═══════════════════════════════════════════════════════════════
-# NOUVELLE VERSION IDEMPOTENTE DE ensure_capital_usdc
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
+# NOUVELLE FONCTION ensure_capital_usdc (lecture seule)
+# ============================================================
 def ensure_capital_usdc(state: dict, price: float, quote_bal_real: float, base_bal_real: float) -> float:
-    if MAX_BUDGET_USDC is not None and MAX_BUDGET_USDC > 0:
-        if abs(state.get("capital_usdc", 0.0) - MAX_BUDGET_USDC) > 1e-8:
-            state["capital_usdc"] = MAX_BUDGET_USDC
-            save_state(state)
-        return MAX_BUDGET_USDC
-    
-    if state.get("capital_usdc", 0.0) > 0:
-        return state["capital_usdc"]
+    """
+    Retourne le capital stratégique alloué (allocated_capital).
+    Ne recalcule plus rien à partir des soldes.
+    Cette fonction est conservée pour compatibilité, mais son rôle est réduit.
+    """
+    return state.get("allocated_capital", 0.0)
 
-    capital = _get_capital_from_snapshot(BASE_ASSET)
-    if capital is not None and capital > 0:
-        state["capital_usdc"] = capital
-        save_state(state)
-        return capital
-
-    inventory_cost = inv_mgr.inventory_cost(state)
-    if inventory_cost <= 0 and base_bal_real > 0 and price > 0:
-        inventory_cost = base_bal_real * price
-    fallback = max(0.0, inventory_cost + quote_bal_real)
-    state["capital_usdc"] = fallback
-    save_state(state)
-    return fallback
-
+# ============================================================
+# NOUVELLE VERSION DE compute_capital_view (architecture RN-019)
+# ============================================================
 def compute_capital_view(state: dict, price: float,
                          quote_bal_real: float | None = None,
                          base_bal_real: float | None = None) -> dict:
     if quote_bal_real is None or base_bal_real is None:
-        quote_bal_real, base_bal_real = exchange.get_balances(
-            QUOTE_ASSET,
-            BASE_ASSET,
-        )
+        quote_bal_real, base_bal_real = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
 
-    capital_usdc = ensure_capital_usdc(state, price, quote_bal_real, base_bal_real)
-    
+    # ---- Invariants RN-019 ----
+    allocated_capital = state.get("allocated_capital", 0.0)
+    wallet_real = quote_bal_real + base_bal_real * price
+    alpha = wallet_real - allocated_capital
+    capital_for_grid = min(wallet_real, allocated_capital)
+    # ---------------------------
+
+    # Données FIFO / PnL (historique)
     inventory_qty = inv_mgr.inventory_qty(state)
     inventory_cost = inv_mgr.inventory_cost(state)
-    
-    if inventory_qty > 0 and inventory_cost <= 0:
-        inventory_cost = inventory_qty * (_num(state.get("P0")) or price)
-
     inventory_value = inv_mgr.inventory_value(state, price)
     unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price)
-    total_pnl = _num(state.get("total_pnl"))
-    total_wallet = capital_usdc + total_pnl + unrealized_pnl
-    capital_for_grid = max(0.0, min(total_wallet, capital_usdc))
-    quote_virtual_usdc = capital_usdc + total_pnl - inventory_cost
-    quote_available = max(0.0, min(quote_virtual_usdc, quote_bal_real))
-    wallet_peak = _num(state.get("wallet_peak"))
-    drawdown = max(0.0, 1.0 - total_wallet / wallet_peak) if wallet_peak > 0 else 0.0
-    pnl_pct = (total_wallet - capital_usdc) / capital_usdc if capital_usdc > 0 else 0.0
+    total_pnl = state.get("total_pnl", 0.0)
 
+    # Wallet peak (mémoire)
+    wallet_peak = state.get("wallet_peak", 0.0)
+    if wallet_peak == 0.0 or wallet_real > wallet_peak:
+        state["wallet_peak"] = wallet_real
+        wallet_peak = wallet_real
+
+    # Indicateurs dérivés
+    drawdown = max(0.0, 1.0 - wallet_real / wallet_peak) if wallet_peak > 0 else 0.0
+    pnl_pct = (wallet_real - allocated_capital) / allocated_capital if allocated_capital > 0 else 0.0
+
+    # Soldes réels (explicites)
+    quote_balance = quote_bal_real
+    base_quantity = base_bal_real
+
+    # Dictionnaire final (clés anciennes et nouvelles)
     return {
-        "capital_usdc": capital_usdc,
+        # Nouvelles clés (RN-019 / RN-020)
+        "wallet_real": wallet_real,
+        "allocated_capital": allocated_capital,
+        "alpha": alpha,
+        "capital_for_grid": capital_for_grid,
+        "quote_balance": quote_balance,
+        "base_quantity": base_quantity,
+
+        # Clés héritées (conservées pour compatibilité)
+        "capital_usdc": allocated_capital,        # ancien nom
+        "total_wallet": wallet_real,              # ancien nom
+        "quote_available": quote_balance,         # ancien nom → aligné sur le solde réel
+        "base_available": base_quantity,          # ancien nom → aligné sur la quantité réelle
         "inventory_qty": inventory_qty,
         "inventory_cost": inventory_cost,
         "inventory_value": inventory_value,
         "unrealized_pnl": unrealized_pnl,
         "total_pnl": total_pnl,
-        "total_wallet": total_wallet,
-        "capital_for_grid": capital_for_grid,
-        "quote_virtual_usdc": quote_virtual_usdc,
-        "quote_available": quote_available,
-        "base_available": inventory_qty,
+        "wallet_peak": wallet_peak,
         "drawdown": drawdown,
         "pnl_pct": pnl_pct,
+        # engaged_capital supprimé
     }
 
-def get_balances(price: float, state: dict | None = None) -> tuple[float, float, float, float]:
+def get_balances(price: float, state: dict | None = None, symbol: str = None) -> tuple[float, float, float, float]:
     global _capital_initial
-    
-    quote_bal_real, base_bal_real = exchange.get_balances(
-        QUOTE_ASSET,
-        BASE_ASSET,
-    )
+
+    quote_bal_real, base_bal_real = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
+
     if state is None:
-        quote_bal_virt = quote_bal_real
         total_wallet = quote_bal_real + base_bal_real * price
         capital_for_grid = min(total_wallet, MAX_BUDGET_USDC) if MAX_BUDGET_USDC else total_wallet
         if _capital_initial is None and total_wallet > 0:
             _capital_initial = total_wallet
-            logger.info(f"💰 Capital initial : {_capital_initial:.2f} {QUOTE_ASSET}")
-        return quote_bal_virt, base_bal_real, total_wallet, capital_for_grid
+            logger.info(f"💰 Capital de référence (wallet) : {_capital_initial:.2f} {QUOTE_ASSET}")
+        return quote_bal_real, base_bal_real, total_wallet, capital_for_grid
 
     view = compute_capital_view(state, price, quote_bal_real, base_bal_real)
-    
-    if _capital_initial is None and view["capital_usdc"] > 0:
-        _capital_initial = view["capital_usdc"]
-        logger.info(f"💰 Capital initial : {_capital_initial:.2f} {QUOTE_ASSET}")
 
-    return view["quote_available"], view["base_available"], view["total_wallet"], view["capital_for_grid"]
+    if _capital_initial is None and view["allocated_capital"] > 0:
+        _capital_initial = view["allocated_capital"]
+        logger.info(f"💰 Budget stratégique : {_capital_initial:.2f} {QUOTE_ASSET}")
+
+    if history_logger and symbol:
+        history_logger.log_capital_view(view, symbol)
+
+    return (view["quote_available"],
+            view["base_available"],
+            view["wallet_real"],
+            view["capital_for_grid"])
 
 def adjust_levels_to_balance(quote_bal: float, base_bal_in_quote: float) -> tuple[int, int]:
     total = quote_bal + base_bal_in_quote
@@ -859,6 +834,7 @@ def get_symbol_precisions():
 
 def migrate_old_state(state: dict) -> dict:
     migrated = False
+    # Migration des positions vers lots
     if "open_positions" in state and state["open_positions"]:
         old_positions = state["open_positions"]
         new_lots = []
@@ -892,13 +868,17 @@ def migrate_old_state(state: dict) -> dict:
         state["total_base_qty"] = computed_qty
         migrated = True
 
+    # Migration capital_usdc -> allocated_capital
+    if "capital_usdc" in state and "allocated_capital" not in state:
+        state["allocated_capital"] = state["capital_usdc"]
+        logger.info("🔄 Migration : capital_usdc -> allocated_capital")
+        migrated = True
+    elif "allocated_capital" not in state:
+        state["allocated_capital"] = 0.0
+
     if migrated:
         logger.info("✅ Migration d'état effectuée")
     return state
-
-# ═══════════════════════════════════════════════════════════════
-# load_state avec conversion SortedGrid + paramètres dynamiques
-# ═══════════════════════════════════════════════════════════════
 
 def load_state() -> dict:
     defaults = {
@@ -909,7 +889,7 @@ def load_state() -> dict:
         "wallet_peak": 0.0, "total_trades": 0, "failed_count": 0,
         "total_slippage": 0.0, "cycle_recalc": 0,
         "ema_slippage_buy": 0.0, "ema_slippage_sell": 0.0,
-        "capital_usdc": 0.0,
+        "allocated_capital": 0.0,   # Nouveau nom
         "total_pnl": 0.0,
         "density_k": 0.65,
         "last_rebuild_price": 0.0,
@@ -925,25 +905,22 @@ def load_state() -> dict:
         "CALIB_REF_ATR_LOW": DENSITY_ATR_LOW,
         "CALIB_REF_ATR_HIGH": DENSITY_ATR_HIGH,
         "CALIB_REF_K_MIN": DENSITY_K_MIN,
-         "last_calibration_time": 0.0,
-         # Mémoire persistante des quantités cumulées déjà appliquées pendant
-         # la réconciliation d'ordres. Voir order_reconciliation.py.
-         "reconciled_orders": {},
+        "last_calibration_time": 0.0,
+        "reconciled_orders": {},
     }
     try:
         persisted_state = STATE_STORE.read()
         if persisted_state is not None:
             state = {**defaults, **persisted_state}
             state = migrate_old_state(state)
-            
-            state, corrected = verify_and_resync_inventory_cost(state)
 
+            state, corrected = verify_and_resync_inventory_cost(state)
             if corrected:
                 logger.warning(
                     "⚠️ inventory_cost incohérent détecté dans le state. "
                     "Valeur recalculée automatiquement à partir des inventory_lots."
                 )
-            
+
             if "last_grid_rebuild_ts" not in state:
                 state["last_grid_rebuild_ts"] = time.time()
             if "last_grid_init_attempt" not in state:
@@ -978,29 +955,17 @@ def save_state(state: dict):
 
 def reconcile_inventory(state: dict, price: float):
     exchange.invalidate_balance_cache()
-
-    _, real_base_bal = exchange.get_balances(
-        QUOTE_ASSET,
-        BASE_ASSET,
-    )
-
+    _, real_base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
     acquisition_price = state.get("P0") or price
-
     changed = inv_mgr.reconcile(
         state,
         real_balance=real_base_bal,
         acquisition_price=acquisition_price,
         source="exchange_reconcile",
     )
-
     if changed:
         state["total_base_qty"] = inv_mgr.inventory_qty(state)
-
-        logger.info(
-            f"✅ Inventaire réconcilié : "
-            f"{state['total_base_qty']:.6f}"
-        )
-
+        logger.info(f"✅ Inventaire réconcilié : {state['total_base_qty']:.6f}")
         save_state(state)
     else:
         logger.info("✅ Inventaire cohérent")
@@ -1008,26 +973,15 @@ def reconcile_inventory(state: dict, price: float):
 def reconcile_open_orders(state: dict):
     try:
         open_orders = exchange.get_open_orders(SYMBOL)
-        
         if not open_orders:
-            logger.warning(
-                f"⚠️ Aucun ordre ouvert trouvé sur {exchange.NAME}."
-            )
-
+            logger.warning(f"⚠️ Aucun ordre ouvert trouvé sur {exchange.NAME}.")
             if state.get("grid_ready", False):
-                logger.warning(
-                    "⚠️ Le state indique une grille active mais l'exchange n'a aucun ordre."
-                )
-                logger.warning(
-                    "🔄 Réinitialisation de la grille demandée."
-                )
-
+                logger.warning("⚠️ Le state indique une grille active mais l'exchange n'a aucun ordre.")
+                logger.warning("🔄 Réinitialisation de la grille demandée.")
                 state["grid_ready"] = False
                 state["buy_grid"] = []
                 state["sell_grid"] = []
-
                 save_state(state)
-
             return True
 
         logger.info(f"🔍 {len(open_orders)} ordre(s) ouvert(s) détecté(s) sur {exchange.NAME}.")
@@ -1045,35 +999,24 @@ def reconcile_open_orders(state: dict):
             persist_state=lambda: save_state(state),
         )
         save_state(state)
-        logger.info(
-            "✅ Réconciliation des ordres ouverts terminée "
-            f"({result['deltas_applied']} delta(s) appliqué(s))."
-        )
+        logger.info("✅ Réconciliation des ordres ouverts terminée "
+                    f"({result['deltas_applied']} delta(s) appliqué(s)).")
         if result["cancel_failures"]:
-            logger.warning(
-                f"⚠️ {result['cancel_failures']} annulation(s) échouée(s) : "
-                "nouvelle tentative au prochain cycle, sans double réconciliation."
-            )
+            logger.warning(f"⚠️ {result['cancel_failures']} annulation(s) échouée(s).")
         return True
     except Exception as e:
         logger.error(f"❌ Erreur réconciliation des ordres ouverts : {e}")
         return False
 
-# ═══════════════════════════════════════════════════════════════
-# INDICATEURS ET MATHÉMATIQUES
-# ═══════════════════════════════════════════════════════════════
-
 def get_heavy_indicators() -> dict | None:
     try:
         df_3m  = exchange.get_klines(SYMBOL, exchange.KLINE_3M,  KLINE_LIMIT)
         df_15m = exchange.get_klines(SYMBOL, exchange.KLINE_15M, 50)
-
         atr_series_3m = ta.volatility.average_true_range(df_3m["high"], df_3m["low"], df_3m["close"], window=14)
         atr = float(atr_series_3m.iloc[-1])
         atr_norm = float(atr_series_3m.iloc[-1]) / float(df_3m["close"].iloc[-1]) if float(df_3m["close"].iloc[-1]) > 0 else 0.01
         dip = ta.trend.adx_pos(df_3m["high"], df_3m["low"], df_3m["close"], window=14).iloc[-1]
         dim = ta.trend.adx_neg(df_3m["high"], df_3m["low"], df_3m["close"], window=14).iloc[-1]
-
         adx_15m = ta.trend.adx(df_15m["high"], df_15m["low"], df_15m["close"], window=14).iloc[-1]
         atr_series_15m = ta.volatility.average_true_range(df_15m["high"], df_15m["low"], df_15m["close"], window=14)
         atr_norm_15m = float(atr_series_15m.iloc[-1]) / float(df_15m["close"].iloc[-1]) if float(df_15m["close"].iloc[-1]) > 0 else 0.01
@@ -1138,8 +1081,7 @@ def compute_gv(capital, P0, Gul, Gll, nu, nl, density_k):
     gv_raw = (capital / denom) * GV_MULTIPLIER if denom > 0 else (capital / (nu+nl)) * GV_MULTIPLIER
     gv_usdc = gv_raw * P0
     return max(MIN_ORDER_USDC, min(gv_usdc, capital * MAX_CELL_RATIO))
-    
-# ── Injection de compute_gv dans CapitalViewBuilder ──────────────────────
+
 CapitalViewBuilder.compute_gv_fn = compute_gv
 
 def compute_density_k(atr_norm_15m, state):
@@ -1157,31 +1099,29 @@ def compute_min_gap(state):
     min_gap = total_cost * 1.5
     base_min = TRADING_FEE_RT * EQ16_MIN_RATIO
     return max(min_gap, base_min)
-    
-    
+
 def format_capital_view(view: CapitalView) -> str:
-    """Formate une CapitalView en bloc compact."""
     lines = []
     lines.append("═══════════════════════════════════════════════════════════════")
     lines.append(f"  CapitalView  [{view.symbol}]  @ {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(view.timestamp))}")
     lines.append("───────────────────────────────────────────────────────────────")
-    lines.append(f"  Wallet        : {view.wallet_balance:>8.2f} USDT")
-    lines.append(f"  Reference     : {view.reference_budget:>8.2f}")
-    lines.append(f"  Grid          : {view.grid_budget:>8.2f}")
+    lines.append(f"  Wallet réel  : {view.wallet_balance:>8.2f} USDT")
+    lines.append(f"  Alloué       : {view.reference_budget:>8.2f}")
+    lines.append(f"  Alpha        : {view.alpha:>+8.2f}")
+    lines.append(f"  Grid Budget  : {view.grid_budget:>8.2f}")
     target_str = f"{view.target_budget:>8.2f}" if view.target_budget is not None else "   None"
-    lines.append(f"  Target        : {target_str}")
-    lines.append(f"  Strategic     : {view.strategic_budget:>8.2f}")
-    lines.append(f"  Ratio         : {view.capital_ratio:>8.3f}")
-    lines.append(f"  BUY Expo      : {view.buy_exposure:>8.2f}")
-    lines.append(f"  SELL Expo     : {view.sell_exposure:>8.2f}")
-    lines.append(f"  BUY Gv        : {view.gv_buy:>8.2f}")
-    lines.append(f"  SELL Gv       : {view.gv_sell:>8.2f}")
-    lines.append(f"  Stress        : {view.stress:>8.3f}")
-    lines.append(f"  ADX           : {view.adx:>6.1f}  [{view.regime}]")
+    lines.append(f"  Target       : {target_str}")
+    lines.append(f"  Ratio        : {view.capital_ratio:>8.3f}")
+    lines.append(f"  BUY Expo     : {view.buy_exposure:>8.2f}")
+    lines.append(f"  SELL Expo    : {view.sell_exposure:>8.2f}")
+    lines.append(f"  BUY Gv       : {view.gv_buy:>8.2f}")
+    lines.append(f"  SELL Gv      : {view.gv_sell:>8.2f}")
+    lines.append(f"  Stress       : {view.stress:>8.3f}")
+    lines.append(f"  ADX          : {view.adx:>6.1f}  [{view.regime}]")
     lines.append(f"  Ordres ouverts: {view.open_orders:>8d}")
     lines.append(f"  Capital engagé: {view.engaged_capital:>8.2f}")
     status_symbol = "🟢" if view.health_status == "HEALTHY" else "🟡" if view.health_status == "WARNING" else "🔴"
-    lines.append(f"  Health        : {status_symbol} {view.health_status}")
+    lines.append(f"  Health       : {status_symbol} {view.health_status}")
     lines.append("═══════════════════════════════════════════════════════════════")
     return "\n".join(lines)
 
@@ -1202,7 +1142,6 @@ def _should_log_info(new_view: CapitalView, prev_view: Optional[CapitalView]) ->
     if new_view.regime != prev_view.regime:
         return True
     return False
-
 
 def enforce_eq16(P0, atr, Gul, Gll, nu, nl, stress, gub, glb, density_k, state):
     for attempt in range(EQ16_MAX_RETRIES+1):
@@ -1230,10 +1169,6 @@ def enforce_eq16(P0, atr, Gul, Gll, nu, nl, stress, gub, glb, density_k, state):
             Gll = max(Gll * 0.97, P0 * (1 - GLL_HARD_MAX_PCT))
     return Gul, Gll, nu, nl
 
-# ═══════════════════════════════════════════════════════════════
-# INITIALISATION DE LA GRILLE
-# ═══════════════════════════════════════════════════════════════
-
 def init_grid(price, atr, state, stress, dip, dim, adx, atr_norm_15m, force=False, reason="first_init"):
     if not force and adx > ADX_TREND_LIMIT:
         state["last_grid_init_attempt"] = time.time()
@@ -1245,11 +1180,23 @@ def init_grid(price, atr, state, stress, dip, dim, adx, atr_norm_15m, force=Fals
     save_state(state)
 
     P0 = price
-    quote_bal, _, total_wallet, capital_for_grid = get_balances(P0, state)
+
+    # ---- Récupération des soldes RÉELS (API) ----
+    quote_bal_real, base_bal_real = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
+    base_value_real = base_bal_real * P0
+
+    # Répartition basée sur les soldes réels
+    target_nu, target_nl = adjust_levels_to_balance(quote_bal_real, base_value_real)
+
+    # ---- Récupération du capital pour la grille (à partir du state) ----
+    # On utilise le même calcul que get_balances, mais on peut aussi appeler get_balances pour obtenir capital_for_grid
+    _, _, total_wallet, capital_for_grid = get_balances(P0, state)
+
     if total_wallet <= 0:
         logger.error("❌ Capital nul — init_grid annulée")
         return False
-    target_nu, target_nl = adjust_levels_to_balance(quote_bal, (capital_for_grid - quote_bal))
+
+    # ---- Suite de l'initialisation (inchangée) ----
     gub, glb, nu, nl, regime = compute_asymmetry(dip, dim, target_nu, target_nl)
     Gul, Gll = compute_dynamic_bounds(P0, atr, stress, gub, glb)
     density_k = compute_density_k(atr_norm_15m, state)
@@ -1295,10 +1242,6 @@ def init_grid(price, atr, state, stress, dip, dim, adx, atr_norm_15m, force=Fals
 
     return True
 
-# ═══════════════════════════════════════════════════════════════
-# SMART ROUTER
-# ═══════════════════════════════════════════════════════════════
-
 def rate_limited_get_order(symbol: str, order_id: int) -> OrderResult:
     global _last_get_order_time
     now = time.time()
@@ -1318,14 +1261,12 @@ def rate_limited_get_order(symbol: str, order_id: int) -> OrderResult:
 
 def execute_market_fallback(side, qty_asset, target_price, state, operational_reason) -> tuple[float | None, float]:
     try:
-        
         result = exchange.create_market_order(
             SYMBOL,
             side,
             qty_asset,
             reference_price=target_price,
         )
-        
         if result.is_filled:
             actual_price = result.avg_price if result.avg_price > 0 else target_price
             filled_qty   = result.executed_qty
@@ -1478,7 +1419,7 @@ def smart_execute_order(side, qty_usdc, target_price, state, current_stress, mac
                     return limit_avg_price, limit_filled_qty
                 else:
                     return None, 0.0
-            
+
             if limit_filled_qty > 0:
                 total_qty = limit_filled_qty + market_filled_qty
                 avg_price = (
@@ -1496,10 +1437,6 @@ def smart_execute_order(side, qty_usdc, target_price, state, current_stress, mac
         logger.error(f"❌ Erreur Smart Router : {e}")
         state["failed_count"] += 1
         return None, 0.0
-
-# ═══════════════════════════════════════════════════════════════
-# CALIBRATION PÉRIODIQUE
-# ═══════════════════════════════════════════════════════════════
 
 CALIBRATION_INTERVAL = 7200
 THRESHOLD_ATR_CHANGE = 0.30
@@ -1554,9 +1491,22 @@ def try_calibrate_params(state: dict):
             "Anciens paramètres conservés sans modification."
         )
 
-# ═══════════════════════════════════════════════════════════════
-# BOUCLE PRINCIPALE
-# ═══════════════════════════════════════════════════════════════
+def get_metrics_filepath(symbol: str) -> str:
+    base_pattern = f"metrics_gateio_{symbol.lower()}_*.jsonl"
+    existing = glob.glob(base_pattern)
+    if not existing:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return f"metrics_gateio_{symbol.lower()}_{ts}.jsonl"
+    existing.sort()
+    latest = existing[-1]
+    if os.path.getsize(latest) > METRICS_MAX_SIZE:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        return f"metrics_gateio_{symbol.lower()}_{ts}.jsonl"
+    return latest
+
+# ============================================================
+# DÉMARRAGE
+# ============================================================
 
 logger.info(f"🚀 Démarrage Moteur Quantitatif {BOT_VERSION} — Target: {SYMBOL}")
 
@@ -1568,13 +1518,9 @@ state = load_state()
 startup.state_loaded = True
 journal = TradeJournal(SYMBOL)
 
-history_logger = HistoryLogger()
-
-# Le contrôleur est volontairement retardé jusqu'à ce que toutes ses
-# dépendances de démarrage soient satisfaites.
 capital_target_controller = None
 
-# ── Calibration initiale ──────────────────────────────────────
+# Calibration initiale
 if _CALIBRATE_AVAILABLE and not state.get("grid_ready"):
     try:
         init_params, duration = run_calibration(True, exchange, SYMBOL, calibrate)
@@ -1594,10 +1540,15 @@ else:
     logger.info("ℹ️ Calibration initiale désactivée ou grille déjà initialisée.")
 startup.calibration_done = True
 
-startup.reconciliation_done = reconcile_open_orders(state)
+# Réconciliation des ordres ouverts et inventaire (si --reconcile)
+if AUTO_RECONCILE:
+    startup.reconciliation_done = reconcile_open_orders(state)
+    # On réconcilie l'inventaire plus tard après avoir obtenu le prix
+else:
+    startup.reconciliation_done = True
 
-# ── Startup journal ─────────────────────────────────────────
-_capital_for_startup = state.get("capital_usdc", 0.0) or (MAX_BUDGET_USDC or 0.0)
+# Capital initial pour le journal
+_capital_for_startup = state.get("allocated_capital", 0.0) or state.get("capital_usdc", 0.0)
 journal.log_startup(state=state, capital_usdc=_capital_for_startup, nb_bots=NB_BOTS)
 
 macro_data = get_heavy_indicators()
@@ -1608,14 +1559,102 @@ while not macro_data:
 
 price0 = get_ws_price()
 if price0:
-    _, _, total_wallet0, _ = get_balances(price0, state)
+    # Réconcilier l'inventaire si demandé
     if AUTO_RECONCILE:
         reconcile_inventory(state, price0)
-    else:
-        logger.info("ℹ️ Réconciliation manuelle désactivée. Utilisez --reconcile au démarrage si nécessaire.")
+    # Sauvegarder après réconciliation
+    save_state(state)
+
+    # ============================================================
+    # GESTION DE --sync-capital (après réconciliation)
+    # ============================================================
+    if SYNC_CAPITAL:
+        # Récupérer les soldes réels à jour
+        quote_bal, base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
+        wallet_real = quote_bal + base_bal * price0
+
+        # Calculer unrealized_pnl à partir du FIFO existant
+        unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price0)
+        total_pnl = state.get("total_pnl", 0.0)
+
+        # Nouveau capital alloué
+        new_allocated = wallet_real - total_pnl - unrealized_pnl
+        if new_allocated > 0:
+            old_allocated = state.get("allocated_capital", 0.0)
+            state["allocated_capital"] = round(new_allocated, 2)
+            journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "manual_sync")
+            logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
+            save_state(state)
+        else:
+            logger.warning(f"⚠️ Nouveau capital calculé <= 0 ({new_allocated:.2f}), garde l'ancien.")
 else:
     total_wallet0 = 0.0
     logger.warning("⚠️ Impossible de réconcilier l'inventaire au démarrage (prix manquant)")
+
+# ============================================================
+# ATTENTE PASSIVE SI allocated_capital == 0 (RN-019D)
+# ============================================================
+if state.get("allocated_capital", 0.0) <= 0:
+    logger.warning("⏳ Aucun budget stratégique (allocated_capital) disponible.")
+    logger.warning("En attente d'une consigne... Le bot reste opérationnel (WS, state, logs) mais ne trade pas.")
+    logger.warning("Pour fournir un budget, utilisez --budget, --allocated-capital, ou --sync-capital au prochain redémarrage.")
+
+    _wait_start_time = time.time()
+    last_capital_check = _wait_start_time
+    while not _shutdown_requested:
+        now = time.time()
+        if now - last_capital_check >= CAPITAL_CHECK_INTERVAL:
+            # Recharger le state pour détecter une mise à jour externe (MetaController)
+            try:
+                fresh_state = STATE_STORE.read()
+                if fresh_state is not None:
+                    new_capital = fresh_state.get("allocated_capital", 0.0)
+                    if new_capital > 0:
+                        # Mettre à jour le state courant
+                        state.update(fresh_state)
+                        wait_duration = now - _wait_start_time
+                        logger.info(f"💰 Budget stratégique reçu : {new_capital:.2f} {QUOTE_ASSET}")
+                        logger.info(f"⏳ Temps d'attente total : {wait_duration:.1f}s")
+                        logger.info("🚀 Activation du moteur de trading. Construction de la grille immédiate.")
+
+                        # On repart d'un chrono propre pour l'initialisation : le temps passé en
+                        # WAITING ne doit pas être comptabilisé comme du "temps d'initialisation".
+                        state["last_grid_init_attempt"] = now
+                        startup = StartupSequence()
+                        startup.configuration_loaded  = True
+                        startup.exchange_connected     = True
+                        startup.state_loaded           = True
+                        startup.calibration_done        = True
+                        startup.reconciliation_done     = True
+
+                        # Forcer la réinitialisation de la grille dès la prochaine itération
+                        state["grid_ready"] = False
+                        save_state(state)
+                        break  # Sort de la boucle d'attente
+                    else:
+                        # Toujours en attente : log toutes les 60 secondes
+                        if int(now) % 60 == 0:
+                            logger.debug(f"⏳ Toujours en attente de budget (allocated_capital={new_capital})")
+                else:
+                    logger.warning("⚠️ Impossible de lire le state pendant l'attente")
+            except Exception as e:
+                logger.error(f"❌ Erreur lors de la lecture du state en attente : {e}")
+
+            last_capital_check = now
+
+        # Pause courte pour ne pas saturer le CPU
+        time.sleep(1)
+
+    # Si on est sorti de la boucle d'attente à cause d'un shutdown, on arrête proprement
+    if _shutdown_requested:
+        logger.info("🛑 Arrêt demandé pendant l'attente.")
+        stop_price_websocket()
+        save_state(state)
+        remove_lock(SYMBOL)
+        sys.exit(0)
+
+    logger.info("🚀 Budget stratégique validé, activation du moteur de trading.")
+# ---- Fin de l'attente passive ----
 
 last_macro_time       = time.time()
 last_log_time         = time.time()
@@ -1623,6 +1662,7 @@ last_info_log         = time.time()
 last_lock_update      = time.time()
 last_ws_check         = time.time()
 last_startup_ws_attempt = 0.0
+last_metrics_time     = time.time()
 stress                = 0.20
 with _ws_retry_lock:
     ws_retry_count = 0
@@ -1630,14 +1670,11 @@ with _ws_retry_lock:
 failed_consecutive = 0
 last_exposure_state = None
 
-
 _prev_capital_view = None
-_force_log_event = True   # pour forcer un log au démarrage
-
+_force_log_event = True
 
 while not _shutdown_requested:
     try:
-               
         if failed_consecutive > 0:
             backoff = min(
                 FAILED_COOLDOWN_INITIAL * (2 ** (failed_consecutive - 1)),
@@ -1684,13 +1721,13 @@ while not _shutdown_requested:
 
         failed_consecutive = 0
 
-        # ── Calibration périodique ────────────────────────
+        # Calibration périodique
         if _CALIBRATE_AVAILABLE and (time.time() - state.get("last_calibration_time", 0) >= CALIBRATION_INTERVAL):
             try_calibrate_params(state)
             state["last_calibration_time"] = time.time()
             save_state(state)
 
-        quote_bal, base_bal, total_wallet, capital_for_grid = get_balances(price, state)
+        quote_bal, base_bal, total_wallet, capital_for_grid = get_balances(price, state, CURRENT_SYMBOL)
 
         if total_wallet <= 0:
             failed_consecutive += 1
@@ -1716,9 +1753,25 @@ while not _shutdown_requested:
 
         if drawdown_dd >= GLOBAL_STOP_LOSS_DD:
             logger.critical(f"🚨 STOP-LOSS (drawdown) : DD={drawdown_dd*100:.2f}% ≥ {GLOBAL_STOP_LOSS_DD*100:.0f}%")
+            journal.log_stop_loss(
+                reason="drawdown",
+                drawdown=drawdown_dd,
+                pnl_pct=pnl_pct,
+                total_pnl=state.get("total_pnl", 0.0),
+                total_wallet=total_wallet,
+                wallet_peak=state["wallet_peak"],
+            )
             break
         if pnl_pct < GLOBAL_STOP_LOSS_PNL:
             logger.critical(f"🚨 STOP-LOSS (PnL total) : PnL={pnl_pct*100:.2f}% < {GLOBAL_STOP_LOSS_PNL*100:.0f}%")
+            journal.log_stop_loss(
+                reason="drawdown",
+                drawdown=drawdown_dd,
+                pnl_pct=pnl_pct,
+                total_pnl=state.get("total_pnl", 0.0),
+                total_wallet=total_wallet,
+                wallet_peak=state["wallet_peak"],
+            )
             break
 
         slip_avg = max(state.get("ema_slippage_buy", 0.0), state.get("ema_slippage_sell", 0.0))
@@ -1792,7 +1845,7 @@ while not _shutdown_requested:
         force_init = False
         if must_init and not state["grid_ready"]:
             last_attempt = state.get("last_grid_init_attempt", 0.0)
-            if time.time() - last_attempt > FORCE_INIT_TIMEOUT:
+            if (time.time() - last_attempt > FORCE_INIT_TIMEOUT) or AUTO_RECONCILE or SYNC_CAPITAL:
                 logger.warning(f"⏰ Timeout d'initialisation dépassé ({FORCE_INIT_TIMEOUT}s) — forcing init_grid même si ADX élevé")
                 force_init = True
 
@@ -1815,15 +1868,12 @@ while not _shutdown_requested:
                 state["last_rebuild_price"] = price
                 save_state(state)
                 _force_log_event = True
-            quote_bal, base_bal, total_wallet, capital_for_grid = get_balances(price, state)
+            quote_bal, base_bal, total_wallet, capital_for_grid = get_balances(price, state, CURRENT_SYMBOL)
 
         if not state["grid_ready"]:
             time.sleep(LOOP_SLEEP)
             continue
 
-        # L'ordre de démarrage est volontairement strict : la grille existe
-        # avant le WebSocket, le WebSocket est connecté avant le contrôleur,
-        # puis seulement les tâches périodiques et le trading démarrent.
         if not startup.grid_initialized:
             startup.grid_initialized = True
             logger.info("✅ Grille initialisée — démarrage de la connexion WebSocket")
@@ -1840,23 +1890,19 @@ while not _shutdown_requested:
             if _startup_ready:
                 logger.info(startup.ready_report())
 
-        # Aucun traitement périodique ni ordre avant le signal READY. En cas
-        # d'indisponibilité réseau, le bot reste explicitement en initialisation
-        # et réessaie le WebSocket sans créer de Timer de reconnexion.
         if not _startup_ready:
             time.sleep(LOOP_SLEEP)
             continue
 
-        # ========== RN-011 : mise à jour du ratio de capital cible ==========
+        # Mise à jour du ratio de capital cible
         capital_target_controller.update(capital_for_grid)
         capital_ratio = capital_target_controller.get_ratio()
 
         sell_grid = state["sell_grid"]
         buy_grid = state["buy_grid"]
 
-        # ── TRAITEMENT BUY ──────────────────────────────────────
+        # TRAITEMENT BUY
         while len(buy_grid) > 0 and price <= buy_grid[0]:
-            # ========== RN-011 : injection du ratio dans le capital effectif ==========
             capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
             capital_effectif *= buy_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
@@ -1866,7 +1912,7 @@ while not _shutdown_requested:
                 touched = buy_grid.pop(0)
                 actual_buy_price, filled_qty = smart_execute_order(exchange.SIDE_BUY, Gv_local, price, state, stress, macro_data)
                 if actual_buy_price is not None and filled_qty > 0:
-                    
+
                     inv_mgr.add_buy_lot(
                         state,
                         qty=filled_qty,
@@ -1918,26 +1964,25 @@ while not _shutdown_requested:
             else:
                 break
 
-        # ── TRAITEMENT SELL ──────────────────────────────────────
+        # TRAITEMENT SELL
         while len(sell_grid) > 0 and price >= sell_grid[0]:
-            # ========== RN-011 : injection du ratio dans le capital effectif ==========
             capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
             capital_effectif *= sell_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
                                   state["nu"], state["nl"], state["density_k"])
             state["Gv"] = Gv_local
-            
+
             qty_asset = round(Gv_local / price, QTY_DECIMALS)
 
             if inv_mgr.inventory_qty(state) >= qty_asset:
-                
+
                 touched = sell_grid.pop(0)
                 actual_sell_price, filled_qty = smart_execute_order(exchange.SIDE_SELL, Gv_local, price, state, stress, macro_data)
-                
+
                 if actual_sell_price is not None and filled_qty > 0:
-                    
+
                     lots_consumed = inv_mgr.consume_fifo(state, filled_qty)
-                    
+
                     consumed_qty = sum(lot["qty"] for lot in lots_consumed)
                     if abs(consumed_qty - filled_qty) > 1e-9:
                         raise RuntimeError(
@@ -1964,7 +2009,7 @@ while not _shutdown_requested:
                         f"(vente @ {actual_sell_price:.4f}) | "
                         f"Cumulé={state['total_pnl']:.4f}"
                     )
-                    
+
                     _gsl = state["Gsl"]
                     _gsu = state["Gsu"]
                     _dk  = state.get("density_k", 0.65)
@@ -2000,7 +2045,7 @@ while not _shutdown_requested:
             else:
                 break
 
-        # ── LOG PÉRIODIQUE ──────────────────────────────────────
+        # LOG PÉRIODIQUE
         if time.time() - last_log_time >= 10.0:
             last_log_time = time.time()
             save_state(state)
@@ -2017,9 +2062,9 @@ while not _shutdown_requested:
             gv_display = state.get("Gv", 0.0)
             pnl_pct = capital_view["pnl_pct"]
 
-            # ========== RN-011 : ajout du ratio dans les logs ==========
             logger.debug(
-                f"📊 {price:.4f} | Capital={total_wallet:.2f} | CapitalGrid={capital_for_grid:.2f} | Stress={stress:.2f} | "
+                f"📊 {price:.4f} | Wallet réel={capital_view['wallet_real']:.2f} | Alloué={capital_view['allocated_capital']:.2f} | Alpha={capital_view['alpha']:+.2f} | "
+                f"Grid Budget={capital_view['capital_for_grid']:.2f} | Stress={stress:.2f} | "
                 f"BUY={len(buy_grid)} SELL={len(sell_grid)} | Gv={gv_display:.2f} | k={state['density_k']:.2f} | "
                 f"Trades={state['total_trades']} | PnL réalisé={state.get('total_pnl',0.0):.4f} | UPnL={unrealized_pnl:+.4f} | "
                 f"PnL total={pnl_pct*100:+.2f}% | Stock={inventory_qty:.4f} (moy={avg_cost:.4f}) | "
@@ -2027,13 +2072,10 @@ while not _shutdown_requested:
                 f"Ratio CapitalTarget={capital_ratio:.3f}"
             )
 
-        # ── CAPITALVIEW : construction et log conditionnel ──
-        # (Ne s'exécute qu'en DEBUG, sur événement forcé, ou toutes les 60s)
+        # CAPITALVIEW
         if LOG_LEVEL <= logging.DEBUG or _force_log_event or (time.time() - last_info_log >= 60):
-            # Récupérer les agrégats existants (ne recrée pas de calcul)
             capital_view_aggregates = compute_capital_view(state, price)
 
-            # Construire la vue
             view = CapitalViewBuilder.build(
                 symbol=SYMBOL,
                 state=state,
@@ -2049,24 +2091,55 @@ while not _shutdown_requested:
                 grid_buy_len=len(buy_grid),
             )
 
-            # Historisation (HistoryLogger)
             if history_logger:
-                history_logger.log_capital_view(view)
+                history_logger.log_capital_view(view, CURRENT_SYMBOL)
 
-            # Log INFO conditionnel (uniquement si changement significatif ou événement)
             if LOG_LEVEL <= logging.INFO:
                 if _should_log_info(view, _prev_capital_view) or _force_log_event:
                     logger.info("\n" + format_capital_view(view))
                     _prev_capital_view = view
                     _force_log_event = False
 
-            # En DEBUG, log systématique
             if LOG_LEVEL <= logging.DEBUG:
                 logger.debug(f"CapitalView (debug): {view}")
 
             last_info_log = time.time()
 
-        # Fin de la boucle - pause
+        # MÉTRIQUES
+        if time.time() - last_metrics_time >= METRICS_INTERVAL:
+            last_metrics_time = time.time()
+
+            entry = {
+                "ts": time.time(),
+                "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "symbol": SYMBOL,
+                "price": price,
+                "wallet_real": capital_view_aggregates["wallet_real"],
+                "allocated_capital": capital_view_aggregates["allocated_capital"],
+                "alpha": capital_view_aggregates["alpha"],
+                "capital_for_grid": capital_view_aggregates["capital_for_grid"],
+                "capital_ratio": capital_ratio,
+                "capital_target": capital_target_controller.current_target if capital_target_controller else None,
+                "Gv": state.get("Gv", 0.0),
+                "stress": stress,
+                "adx": macro_data.get("adx", 0.0),
+                "trend_ratio": dip / max(dim, 0.001),
+                "buy_exposure_factor": buy_exposure_factor,
+                "sell_exposure_factor": sell_exposure_factor,
+                "drawdown_dd": drawdown_dd,
+                "total_wallet": total_wallet,
+                "quote_bal": quote_bal,
+                "inventory_qty": capital_view_aggregates.get("inventory_qty", 0.0),
+                "unrealized_pnl": unrealized_pnl,
+                "total_pnl": state.get("total_pnl", 0.0),
+                "pnl_pct": pnl_pct,
+                "total_trades": state.get("total_trades", 0),
+            }
+
+            metrics_file = get_metrics_filepath(SYMBOL)
+            with open(metrics_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
         time.sleep(LOOP_SLEEP)
 
     except Exception as e:
@@ -2075,7 +2148,7 @@ while not _shutdown_requested:
         time.sleep(5)
 
 stop_price_websocket()
-remove_lock(SYMBOL)
 logger.info("🛑 Arrêt propre — sauvegarde finale...")
 save_state(state)
+remove_lock(SYMBOL)
 logger.info("✅ Bot arrêté.")

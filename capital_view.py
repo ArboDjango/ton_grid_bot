@@ -1,5 +1,6 @@
 # capital_view.py
 # RN-105.1 : Entité métier officielle représentant l'état économique complet du moteur.
+# RN-019 : Ajout de l'alpha (performance) et alignement sur allocated_capital.
 
 from dataclasses import dataclass
 from typing import Optional
@@ -12,7 +13,8 @@ class CapitalView:
     symbol: str
 
     wallet_balance: float
-    reference_budget: float
+    reference_budget: float          # allocated_capital (anciennement capital_usdc)
+    alpha: float                     # wallet_balance - reference_budget (performance)
     grid_budget: float
     target_budget: Optional[float]
 
@@ -67,8 +69,9 @@ class CapitalViewBuilder:
         if timestamp is None:
             timestamp = time.time()
 
-        wallet_balance = capital_view_aggregates["total_wallet"]
-        reference_budget = state.get("capital_usdc", 0.0)
+        wallet_balance = capital_view_aggregates["total_wallet"]          # wallet_real
+        reference_budget = state.get("allocated_capital", 0.0)            # ← MODIFIÉ : allocated_capital
+        alpha = wallet_balance - reference_budget                         # ← NOUVEAU
         grid_budget = capital_view_aggregates.get("capital_for_grid", 0.0)
 
         target_budget = (
@@ -123,6 +126,7 @@ class CapitalViewBuilder:
             symbol=symbol,
             wallet_balance=wallet_balance,
             reference_budget=reference_budget,
+            alpha=alpha,                                                # ← NOUVEAU
             grid_budget=grid_budget,
             target_budget=target_budget,
             strategic_budget=strategic_budget,
