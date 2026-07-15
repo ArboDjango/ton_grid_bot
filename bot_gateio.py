@@ -32,7 +32,7 @@ from process_synchronization import AtomicJsonStateStore, BotLock, LockUnavailab
 
 from capital_target import CapitalTargetController
 
-from capital_view import CapitalView, CapitalViewBuilder
+from capital_view import CapitalView, CapitalViewBuilder, compute_capital_view
 
 from history_logger import HistoryLogger
 history_logger = HistoryLogger()
@@ -714,67 +714,9 @@ def ensure_capital_usdc(state: dict, price: float, quote_bal_real: float, base_b
     return state.get("allocated_capital", 0.0)
 
 # ============================================================
-# NOUVELLE VERSION DE compute_capital_view (architecture RN-019)
+# compute_capital_view : importée depuis capital_view.py (RN-020)
+# Single Source of Economic Truth — voir capital_view.compute_capital_view
 # ============================================================
-def compute_capital_view(state: dict, price: float,
-                         quote_bal_real: float | None = None,
-                         base_bal_real: float | None = None) -> dict:
-    if quote_bal_real is None or base_bal_real is None:
-        quote_bal_real, base_bal_real = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
-
-    # ---- Invariants RN-019 ----
-    allocated_capital = state.get("allocated_capital", 0.0)
-    wallet_real = quote_bal_real + base_bal_real * price
-    alpha = wallet_real - allocated_capital
-    capital_for_grid = min(wallet_real, allocated_capital)
-    # ---------------------------
-
-    # Données FIFO / PnL (historique)
-    inventory_qty = inv_mgr.inventory_qty(state)
-    inventory_cost = inv_mgr.inventory_cost(state)
-    inventory_value = inv_mgr.inventory_value(state, price)
-    unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price)
-    total_pnl = state.get("total_pnl", 0.0)
-
-    # Wallet peak (mémoire)
-    wallet_peak = state.get("wallet_peak", 0.0)
-    if wallet_peak == 0.0 or wallet_real > wallet_peak:
-        state["wallet_peak"] = wallet_real
-        wallet_peak = wallet_real
-
-    # Indicateurs dérivés
-    drawdown = max(0.0, 1.0 - wallet_real / wallet_peak) if wallet_peak > 0 else 0.0
-    pnl_pct = (wallet_real - allocated_capital) / allocated_capital if allocated_capital > 0 else 0.0
-
-    # Soldes réels (explicites)
-    quote_balance = quote_bal_real
-    base_quantity = base_bal_real
-
-    # Dictionnaire final (clés anciennes et nouvelles)
-    return {
-        # Nouvelles clés (RN-019 / RN-020)
-        "wallet_real": wallet_real,
-        "allocated_capital": allocated_capital,
-        "alpha": alpha,
-        "capital_for_grid": capital_for_grid,
-        "quote_balance": quote_balance,
-        "base_quantity": base_quantity,
-
-        # Clés héritées (conservées pour compatibilité)
-        "capital_usdc": allocated_capital,        # ancien nom
-        "total_wallet": wallet_real,              # ancien nom
-        "quote_available": quote_balance,         # ancien nom → aligné sur le solde réel
-        "base_available": base_quantity,          # ancien nom → aligné sur la quantité réelle
-        "inventory_qty": inventory_qty,
-        "inventory_cost": inventory_cost,
-        "inventory_value": inventory_value,
-        "unrealized_pnl": unrealized_pnl,
-        "total_pnl": total_pnl,
-        "wallet_peak": wallet_peak,
-        "drawdown": drawdown,
-        "pnl_pct": pnl_pct,
-        # engaged_capital supprimé
-    }
 
 def get_balances(price: float, state: dict | None = None, symbol: str = None) -> tuple[float, float, float, float]:
     global _capital_initial
@@ -789,7 +731,7 @@ def get_balances(price: float, state: dict | None = None, symbol: str = None) ->
             logger.info(f"💰 Capital de référence (wallet) : {_capital_initial:.2f} {QUOTE_ASSET}")
         return quote_bal_real, base_bal_real, total_wallet, capital_for_grid
 
-    view = compute_capital_view(state, price, quote_bal_real, base_bal_real)
+    view = compute_capital_view(state, price, quote_bal_real, base_bal_real, update_peak=False)
 
     if _capital_initial is None and view["allocated_capital"] > 0:
         _capital_initial = view["allocated_capital"]
@@ -1734,7 +1676,7 @@ while not _shutdown_requested:
             time.sleep(LOOP_SLEEP)
             continue
 
-        capital_view = compute_capital_view(state, price)
+        capital_view = compute_capital_view(state, price, quote_bal, base_bal, update_peak=True)
 
         if state["wallet_peak"] == 0.0 or total_wallet > state["wallet_peak"]:
             state["wallet_peak"] = total_wallet
@@ -2050,7 +1992,7 @@ while not _shutdown_requested:
             last_log_time = time.time()
             save_state(state)
 
-            capital_view = compute_capital_view(state, price)
+            capital_view = compute_capital_view(state, price, quote_bal, base_bal, update_peak=False)
             inventory_qty = capital_view["inventory_qty"]
             nb_lots = len(state.get("inventory_lots", []))
             avg_cost = 0.0
@@ -2074,7 +2016,7 @@ while not _shutdown_requested:
 
         # CAPITALVIEW
         if LOG_LEVEL <= logging.DEBUG or _force_log_event or (time.time() - last_info_log >= 60):
-            capital_view_aggregates = compute_capital_view(state, price)
+            capital_view_aggregates = compute_capital_view(state, price, quote_bal, base_bal, update_peak=False)
 
             view = CapitalViewBuilder.build(
                 symbol=SYMBOL,

@@ -13,8 +13,15 @@ Rôle :
 Invariants (vérifiés systématiquement par fail-fast) :
   1. inventory_qty == sum(lot["qty"])
   2. inventory_cost == sum(lot["qty"] * lot["buy_price"])
-  3. wallet == capital_usdc + total_pnl + pnl_latent
-  4. 0 <= drawdown_pct <= 1
+  3. 0 <= drawdown_pct <= 1
+
+RN-020 (Single Source of Economic Truth) : le wallet n'est plus recalculé à
+partir d'une formule locale (capital_usdc + total_pnl + pnl_latent). Il est
+désormais obtenu via capital_view.compute_capital_view(), à partir des soldes
+réels de l'exchange — la même fonction utilisée par bot_gateio.py. L'ancien
+invariant "wallet == capital_usdc + total_pnl + pnl_latent" est donc supprimé :
+il supposait un modèle comptable synthétique, alors que l'écart entre le
+wallet réel et le capital alloué est précisément la métrique "alpha".
 
 Ce fichier ne produit plus de rapport humain.
 ================================================================================
@@ -60,6 +67,9 @@ except ImportError:
 import inventory_manager as inv_mgr
 from process_synchronization import AtomicJsonStateStore
 
+# ─── IMPORT SINGLE SOURCE OF ECONOMIC TRUTH (RN-020) ──────────
+from capital_view import compute_capital_view
+
 # ─── CONSTANTES ──────────────────────────────────────────────
 DEFAULT_EXCHANGE = os.getenv("EXCHANGE", "gateio").lower()
 SUPPORTED_QUOTES = ("USDC", "USDT")
@@ -93,6 +103,18 @@ def create_exchange(name: str) -> "ExchangeBase":
         from exchange_coinbase import ExchangeCoinbase
         return ExchangeCoinbase()
     raise ValueError(f"Exchange non supporté : {name}")
+
+def split_symbol(symbol: str, quote_hint: str = None) -> tuple[str, str]:
+    """
+    Sépare un symbole (ex: "INJUSDC") en (quote_asset, base_asset) (ex: ("USDC", "INJ")).
+    Utilisé pour récupérer les soldes réels via exchange.get_balances(quote, base).
+    """
+    if quote_hint and symbol.endswith(quote_hint):
+        return quote_hint, symbol[: -len(quote_hint)]
+    for q in SUPPORTED_QUOTES:
+        if symbol.endswith(q):
+            return q, symbol[: -len(q)]
+    raise ValueError(f"Impossible de déterminer la quote asset pour le symbole {symbol}")
 
 def exchange_key(exchange: "ExchangeBase") -> str:
     return "".join(ch for ch in exchange.NAME.lower() if ch.isalnum())
@@ -237,46 +259,37 @@ def load_state(state_file: str) -> dict:
         logger.error(f"Erreur de décodage JSON dans {state_file} : {e}")
         return defaults
 
-# ─── VÉRIFICATIONS DES INVARIANTS ─────────────────────────────
-def verify_invariants(state: dict, metrics: dict):
+# ─── VÉRIFICATIONS DES INVARIANTS (RN-020) ────────────────────
+def verify_economic_view(economic: dict, state: dict):
     """
-    Vérifie les invariants comptables.
+    Vérifie les invariants comptables à partir de la vue économique unique
+    (capital_view.compute_capital_view). Ne recalcule plus le wallet : celui-ci
+    provient désormais des soldes réels de l'exchange, la même source que
+    bot_gateio.py.
     Lance une RuntimeError en cas de violation (fail-fast).
     """
     # Invariant 1 : inventory_qty == somme des lots
     lots = state.get("inventory_lots", [])
     computed_qty = sum(float(lot.get("qty", 0.0)) for lot in lots)
-    if abs(metrics["inventory_qty"] - computed_qty) > INVARIANT_EPSILON:
+    if abs(economic["inventory_qty"] - computed_qty) > INVARIANT_EPSILON:
         raise RuntimeError(
-            f"Invariant 1 violé : inventory_qty={metrics['inventory_qty']:.8f}, "
+            f"Invariant 1 violé : inventory_qty={economic['inventory_qty']:.8f}, "
             f"somme des lots={computed_qty:.8f}"
         )
 
     # Invariant 2 : inventory_cost == somme(qty * buy_price)
     computed_cost = sum(float(lot.get("qty", 0.0)) * float(lot.get("buy_price", 0.0)) for lot in lots)
-    if abs(metrics["inventory_cost"] - computed_cost) > INVARIANT_EPSILON:
+    if abs(economic["inventory_cost"] - computed_cost) > INVARIANT_EPSILON:
         raise RuntimeError(
-            f"Invariant 2 violé : inventory_cost={metrics['inventory_cost']:.8f}, "
+            f"Invariant 2 violé : inventory_cost={economic['inventory_cost']:.8f}, "
             f"coût recalculé={computed_cost:.8f}"
         )
 
-    # Invariant 3 : wallet == capital_usdc + total_pnl + pnl_latent
-    capital_usdc = metrics["capital_usdc"]
-    total_pnl = metrics["total_pnl"]
-    pnl_latent = metrics["pnl_latent"]
-    wallet = metrics["wallet"]
-    computed_wallet = capital_usdc + total_pnl + pnl_latent
-    if abs(wallet - computed_wallet) > INVARIANT_EPSILON:
-        raise RuntimeError(
-            f"Invariant 3 violé : wallet={wallet:.8f}, "
-            f"capital+pnl+latent={computed_wallet:.8f}"
-        )
-
-    # Invariant 4 : drawdown_pct dans [0, 1]
-    dd = metrics["drawdown_pct"]
+    # Invariant 3 : drawdown dans [0, 1]
+    dd = economic["drawdown"]
     if not (0.0 <= dd <= 1.0):
         raise RuntimeError(
-            f"Invariant 4 violé : drawdown_pct={dd:.8f} hors de l'intervalle [0, 1]"
+            f"Invariant 3 violé : drawdown={dd:.8f} hors de l'intervalle [0, 1]"
         )
 
     logger.debug("✅ Tous les invariants sont respectés.")
@@ -298,41 +311,35 @@ def compute_trading_metrics(state: dict) -> dict:
     }
 
 
-# ─── CALCUL DES MÉTRIQUES ──────────────────────────────────
-def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str) -> dict:
+# ─── CALCUL DES MÉTRIQUES (RN-020) ─────────────────────────
+def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str,
+                     quote_balance: float, base_balance: float) -> dict:
     """
-    Calcule les métriques fondamentales à partir du state et du prix.
+    Calcule les métriques fondamentales à partir du state, du prix et des
+    soldes réels de l'exchange.
+
+    RN-020 (Single Source of Economic Truth) : le calcul économique
+    (wallet, alpha, capital pour la grille, drawdown, inventaire) n'est plus
+    dupliqué ici. Il provient de capital_view.compute_capital_view(), la même
+    fonction utilisée par bot_gateio.py. analyse.py ne fait que la mettre en
+    forme selon le contrat V1.1 et vérifier les invariants restants.
+
     Retourne un dictionnaire conforme au contrat V1.1.
     Les invariants sont vérifiés avant le retour.
     """
-    # --- 1. Données d'inventaire (via inventory_manager) ---
-    inventory_qty = inv_mgr.inventory_qty(state)
-    inventory_cost = inv_mgr.inventory_cost(state)
-    inventory_value = inventory_qty * price
-    pnl_latent = inventory_value - inventory_cost
+    # --- 1. Vue économique unique (RN-020) ---
+    # update_peak=False : analyse.py est un observateur en lecture seule,
+    # il ne doit pas modifier le peak persistant du bot (propriété du process live).
+    economic = compute_capital_view(state, price, quote_balance, base_balance, update_peak=False)
 
-    # --- 2. Métriques du wallet ---
-    capital_usdc = state.get("capital_usdc", 0.0)
-    total_pnl = state.get("total_pnl", 0.0)
-    wallet = capital_usdc + total_pnl + pnl_latent
+    allocated_capital = economic["allocated_capital"]
+    alpha = economic["alpha"]
+    alpha_pct = alpha / allocated_capital if allocated_capital > 0 else 0.0
 
-    # --- 3. Peak (correction : max avec le wallet courant) ---
-    wallet_peak = max(state.get("wallet_peak", 0.0), wallet)
-
-    # --- 4. Drawdown (correction : borne explicite) ---
-    if wallet_peak > 0:
-        drawdown_pct = max(0.0, min(1.0, 1.0 - wallet / wallet_peak))
-    else:
-        drawdown_pct = 0.0
-
-    # --- 5. Alpha ---
-    alpha = total_pnl + pnl_latent
-    alpha_pct = alpha / capital_usdc if capital_usdc > 0 else 0.0
-
-    # --- 6. Trading metrics ---
+    # --- 2. Trading metrics ---
     trading = compute_trading_metrics(state)
-    
-    # --- 7. Diagnostics (déplacés dans un sous-objet) ---
+
+    # --- 3. Diagnostics (sous-objet) ---
     sell_grid = state.get("sell_grid", [])
     buy_grid = state.get("buy_grid", [])
     diagnostics = {
@@ -343,24 +350,25 @@ def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str) 
         "nb_levels": len(sell_grid) + len(buy_grid),
     }
 
-    # --- 8. Construction du résultat brut ---
+    # --- 4. Construction du résultat (contrat V1.1, noms inchangés) ---
     result = {
         # Identité de la paire (rend l'objet autonome)
         "symbol": symbol,
         "exchange": exchange_name,
 
         # Métriques économiques (premier niveau)
-        "capital_usdc": capital_usdc,
-        "wallet": wallet,
-        "wallet_peak": wallet_peak,
-        "total_pnl": total_pnl,
-        "inventory_qty": inventory_qty,
-        "inventory_cost": inventory_cost,
-        "inventory_value": inventory_value,
-        "pnl_latent": pnl_latent,
+        "allocated_capital": allocated_capital,
+        "capital_usdc": allocated_capital,   # conservé pour information mais inutile depuis RN-020
+        "wallet": economic["wallet_real"],
+        "wallet_peak": economic["wallet_peak"],
+        "total_pnl": economic["total_pnl"],
+        "inventory_qty": economic["inventory_qty"],
+        "inventory_cost": economic["inventory_cost"],
+        "inventory_value": economic["inventory_value"],
+        "pnl_latent": economic["unrealized_pnl"],
         "alpha": alpha,
         "alpha_pct": alpha_pct,
-        "drawdown_pct": drawdown_pct,
+        "drawdown_pct": economic["drawdown"],
 
         # Nom métier cohérent
         **trading,
@@ -369,8 +377,8 @@ def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str) 
         "diagnostics": diagnostics,
     }
 
-    # --- 9. Vérification systématique des invariants (fail-fast) ---
-    verify_invariants(state, result)
+    # --- 5. Vérification systématique des invariants restants (fail-fast) ---
+    verify_economic_view(economic, state)
 
     return result
     
@@ -481,7 +489,19 @@ def main():
             continue
 
         try:
-            metrics = compute_metrics(state, price, symbol, args.exchange)
+            quote_asset, base_asset = split_symbol(symbol, args.quote)
+            quote_balance, base_balance = exchange.get_balances(quote_asset, base_asset)
+            logger.info(
+                f"{symbol} | quote_asset={quote_asset} quote_balance={quote_balance:.2f} | "
+                f"base_asset={base_asset} base_balance={base_balance:.8f} | "
+                f"price={price:.4f}"
+            )
+        except Exception as e:
+            logger.error(f"Erreur lors de l'obtention des soldes pour {symbol} : {e}")
+            continue
+
+        try:
+            metrics = compute_metrics(state, price, symbol, args.exchange, quote_balance, base_balance)
             metrics = compute_temporal_metrics(metrics)
             pairs_metrics[symbol] = metrics
         except RuntimeError as e:

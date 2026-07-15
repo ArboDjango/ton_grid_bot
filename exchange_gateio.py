@@ -100,8 +100,7 @@ class ExchangeGateIO(ExchangeBase):
         self._spot   = gate_api.SpotApi(self._client)
 
         self._balance_cache: dict = {
-            "quote":     0.0,
-            "base":      0.0,
+            "balances": {},
             "timestamp": 0.0,
         }
 
@@ -470,29 +469,38 @@ class ExchangeGateIO(ExchangeBase):
     def get_balances(
         self,
         quote_asset: str,
-        base_asset:  str,
+        base_asset: str,
     ) -> tuple[float, float]:
         """
-        Soldes disponibles (hors ordres ouverts) avec cache TTL.
+        Retourne les soldes disponibles (hors ordres ouverts) avec cache TTL.
 
-        list_spot_accounts() retourne une liste d'objets avec :
-          .currency  → nom de l'asset  (str, ex: "USDT", "FIL")
-          .available → solde libre     (str → float)
+        Le cache mémorise l'ensemble des soldes du compte et non plus
+        uniquement un couple (quote/base). Ainsi plusieurs paires peuvent
+        interroger les soldes sans se polluer mutuellement.
         """
-        now   = time.time()
+        now = time.time()
         cache = self._balance_cache
+
+        # Cache valide
         if now - cache["timestamp"] < self._BALANCE_CACHE_TTL:
-            return cache["quote"], cache["base"]
-        try:
-            accounts = self._spot.list_spot_accounts()
-            bals  = {a.currency: float(a.available) for a in accounts}
-            quote = bals.get(quote_asset, 0.0)
-            base  = bals.get(base_asset,  0.0)
-            cache.update({"quote": quote, "base": base, "timestamp": now})
-            return quote, base
-        except Exception:
-            logger.exception("❌ Erreur récupération soldes réels")
-            return cache["quote"], cache["base"]
+            balances = cache["balances"]
+        else:
+            try:
+                accounts = self._spot.list_spot_accounts()
+                balances = {
+                    a.currency.upper(): float(a.available)
+                    for a in accounts
+                }
+                cache["balances"] = balances
+                cache["timestamp"] = now
+            except Exception:
+                logger.exception("❌ Erreur récupération soldes réels")
+                balances = cache.get("balances", {})
+
+        quote = balances.get(quote_asset.upper(), 0.0)
+        base = balances.get(base_asset.upper(), 0.0)
+
+        return quote, base
 
     def invalidate_balance_cache(self) -> None:
         """Force le prochain get_balances() à aller chercher en live sur l'API."""
