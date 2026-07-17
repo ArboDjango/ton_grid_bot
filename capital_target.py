@@ -29,23 +29,22 @@ class CapitalTargetController:
         symbol: str,
         state_dir: str = ".",
         check_interval: float = 30.0,
-        max_adjust_per_cycle: float = 0.02,
+        deadband: float = 0.05,          # nouveau paramètre
         min_ratio: float = 0.5,
         max_ratio: float = 2.0,
     ):
         self.symbol = symbol.lower()
         self.state_dir = Path(state_dir)
         self.control_path = self.state_dir / f"control_{self.symbol}.json"
-
         self.check_interval = check_interval
-        self.max_adjust_per_cycle = max_adjust_per_cycle
+        self.deadband = deadband          # stockage
         self.min_ratio = min_ratio
         self.max_ratio = max_ratio
 
-        # État en mémoire
         self.current_target: Optional[float] = None
         self.last_read_time: float = 0.0
         self.capital_ratio: float = 1.0
+        self.state: str = "HOLD"          # nouvel attribut
 
     def _read_control_file(self) -> Optional[float]:
         """Lit le fichier de contrôle et retourne capital_target, ou None."""
@@ -70,40 +69,29 @@ class CapitalTargetController:
         La lecture du fichier est limitée par check_interval.
         """
         now = time.time()
-
-        # Relecture périodique du fichier
         if now - self.last_read_time >= self.check_interval:
             self.last_read_time = now
             target = self._read_control_file()
             if target is not None and target > 0:
-                if self.current_target != target:
-                    logger.info("🎯 Nouvelle cible de capital reçue : %.2f", target)
                 self.current_target = target
 
-        # Si pas de cible, on ne touche pas au ratio
-        if self.current_target is None or current_capital <= 0:
+        if self.current_target is None or self.current_target <= 0 or current_capital <= 0:
+            self.capital_ratio = 1.0
+            self.state = "HOLD"
             return
 
-        # Ratio désiré
-        desired = self.current_target / current_capital
-        desired = max(self.min_ratio, min(self.max_ratio, desired))
+        target = self.current_target
+        ratio = target / current_capital
+        self.capital_ratio = max(self.min_ratio, min(self.max_ratio, ratio))
 
-        # Ajustement progressif avec pas max
-        diff = desired - self.capital_ratio
-        step = max(-self.max_adjust_per_cycle, min(self.max_adjust_per_cycle, diff))
-        self.capital_ratio += step
-
-        # Reclamp
-        self.capital_ratio = max(self.min_ratio, min(self.max_ratio, self.capital_ratio))
-
-        # Les ajustements réguliers ne sont utiles qu'en diagnostic : aucun
-        # message INFO périodique ne doit masquer les événements de démarrage.
-        if abs(step) > 1e-12:
-            logger.debug(
-                "CapitalTarget ratio ajusté : %.3f -> %.3f (cible=%.2f, actuel=%.2f)",
-                self.capital_ratio - step, self.capital_ratio,
-                self.current_target, current_capital,
-            )
+        # Calcul de l'état (zone morte)
+        error_pct = (current_capital - target) / target
+        if abs(error_pct) <= self.deadband:
+            self.state = "HOLD"
+        elif error_pct > 0:
+            self.state = "DECREASE"
+        else:
+            self.state = "INCREASE"
 
     def get_ratio(self) -> float:
         """Retourne le ratio d'ajustement actuel."""

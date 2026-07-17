@@ -895,6 +895,46 @@ def save_state(state: dict):
     except Exception as e:
         logger.error(f"❌ Erreur sauvegarde : {e}")
 
+def reset_economic_period(state, wallet_real, reason):
+    """
+    Réinitialise volontairement la référence de drawdown en ouvrant une nouvelle période économique.
+
+    Préconditions (à garantir par l'appelant) :
+    - balances relues depuis l'exchange
+    - wallet_real validé (valeur cohérente, issue de compute_capital_view)
+    - ordres ouverts réconciliés
+    - opération explicitement demandée par l'utilisateur
+
+    Ne jamais appeler depuis la boucle principale.
+    Ne jamais appeler automatiquement.
+    """
+    old_peak = float(state.get("wallet_peak", wallet_real))
+
+    # Idempotence : si le peak est déjà égal à wallet_real, on ne fait rien (log DEBUG)
+    if abs(old_peak - wallet_real) < 1e-9:
+        logger.debug(
+            "ECONOMIC_PERIOD_RESET (ignoré - idempotent) "
+            f"peak={old_peak:.2f} wallet_real={wallet_real:.2f} reason={reason}"
+        )
+        return
+
+    # Log explicite (INFO, car opération normale et volontaire)
+    logger.info(f"🟡 Ouverture d'une nouvelle période économique (reason={reason})")
+
+    # Modification unique
+    state["wallet_peak"] = wallet_real
+
+    # Sauvegarde atomique immédiate (UNIQUE sauvegarde)
+    save_state(state)
+
+    # Journalisation
+    logger.info(
+        "ECONOMIC_PERIOD_RESET "
+        f"reason={reason} "
+        f"old_wallet_peak={old_peak:.2f} "
+        f"new_wallet_peak={wallet_real:.2f}"
+    )
+
 def reconcile_inventory(state: dict, price: float):
     exchange.invalidate_balance_cache()
     _, real_base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
@@ -1513,7 +1553,19 @@ if price0:
     if SYNC_CAPITAL:
         # Récupérer les soldes réels à jour
         quote_bal, base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
-        wallet_real = quote_bal + base_bal * price0
+
+        # Lecture pure du CapitalView.
+        # update_peak=False est indispensable ici : nous devons connaître
+        # wallet_real AVANT d'ouvrir une nouvelle période économique,
+        # sans modifier le High Water Mark historique.
+        capital_view = compute_capital_view(
+            state,
+            price0,
+            quote_bal,
+            base_bal,
+            update_peak=False,
+        )
+        wallet_real = capital_view["wallet_real"]
 
         # Calculer unrealized_pnl à partir du FIFO existant
         unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price0)
@@ -1524,9 +1576,12 @@ if price0:
         if new_allocated > 0:
             old_allocated = state.get("allocated_capital", 0.0)
             state["allocated_capital"] = round(new_allocated, 2)
-            journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "manual_sync")
+            journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "sync_capital")
             logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
-            save_state(state)
+
+            # Réinitialisation du peak économique (ouvre une nouvelle période)
+            # La sauvegarde est faite à l'intérieur de reset_economic_period
+            reset_economic_period(state, wallet_real, "sync_capital")
         else:
             logger.warning(f"⚠️ Nouveau capital calculé <= 0 ({new_allocated:.2f}), garde l'ancien.")
 else:
@@ -1614,6 +1669,10 @@ last_exposure_state = None
 
 _prev_capital_view = None
 _force_log_event = True
+
+_last_logged_ratio = 1.0
+_last_logged_state = "HOLD"
+_last_logged_target = None
 
 while not _shutdown_requested:
     try:
@@ -1839,6 +1898,45 @@ while not _shutdown_requested:
         # Mise à jour du ratio de capital cible
         capital_target_controller.update(capital_for_grid)
         capital_ratio = capital_target_controller.get_ratio()
+
+        # ---- Diagnostic CapitalTargetController ----
+        if capital_target_controller is not None:
+            target = capital_target_controller.current_target
+            if target is not None and target > 0:
+                ratio = capital_target_controller.get_ratio()
+                ctrl_state = capital_target_controller.state
+                deadband = capital_target_controller.deadband
+                last_read = capital_target_controller.last_read_time
+                target_age = time.time() - last_read if last_read > 0 else float('inf')
+
+                # Détection de changement significatif
+                changed = (abs(ratio - _last_logged_ratio) > 0.02 or
+                           ctrl_state != _last_logged_state or
+                           target != _last_logged_target)
+
+                if changed:
+                    _last_logged_ratio = ratio
+                    _last_logged_state = ctrl_state
+                    _last_logged_target = target
+
+                    lines = [
+                        "═══════════════════════════════════════",
+                        "CapitalTargetController — DIAGNOSTIC",
+                        "───────────────────────────────────────",
+                        f"Target               : {target:>8.2f}",
+                        f"Target Source        : {capital_target_controller.control_path}",
+                        f"Target Age (s)       : {target_age:>8.1f}",
+                        f"Controlled Value     : {capital_for_grid:>8.2f}  (capital_for_grid)",
+                        f"Wallet réel          : {total_wallet:>8.2f}",
+                        f"Allocated capital    : {state.get('allocated_capital',0.0):>8.2f}",
+                        f"Capital Ratio        : {ratio:>8.3f}",
+                        f"État du contrôleur   : {ctrl_state}",
+                        f"Zone morte           : ±{deadband*100:.0f}%",
+                        f"Écart (target - grid): {capital_for_grid - target:>+8.2f}",
+                        f"Écart (target - wallet): {total_wallet - target:>+8.2f}",
+                        "═══════════════════════════════════════",
+                    ]
+                    logger.info("\n".join(lines))
 
         sell_grid = state["sell_grid"]
         buy_grid = state["buy_grid"]
