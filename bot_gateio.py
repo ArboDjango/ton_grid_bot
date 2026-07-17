@@ -40,6 +40,7 @@ from capital_transition_guard import (
     TransitionStatus,
 )
 from bot_capital_sync import StateDictEconomicRepository, build_manual_sync_request
+from bot_realized_pnl_sync import build_realized_profit_request
 
 from history_logger import HistoryLogger
 history_logger = HistoryLogger()
@@ -2085,6 +2086,32 @@ while not _shutdown_requested:
                         f"(vente @ {actual_sell_price:.4f}) | "
                         f"Cumulé={state['total_pnl']:.4f}"
                     )
+
+                    # ============================================================
+                    # CapitalTransitionGuard — profit realise (RN-022/023)
+                    # ============================================================
+                    # Perimetre strictement limite a REALIZED_PROFIT pour cette
+                    # etape. Le montant transmis est exactement pnl_trade, deja
+                    # calcule ci-dessus, sans aucune transformation. Le cas
+                    # pnl_trade <= 0 (perte ou trade neutre) n'est pas traite ici
+                    # (REALIZED_LOSS, hors perimetre de cette etape).
+                    if pnl_trade > 0:
+                        profit_request = build_realized_profit_request(
+                            bot_id=CURRENT_SYMBOL,
+                            amount=pnl_trade,
+                            justification="Vente exécutée : profit réalisé (FIFO)",
+                        )
+                        profit_result = capital_guard.submit_transition(profit_request)
+                        if profit_result.status is TransitionStatus.ACCEPTED:
+                            logger.info(
+                                f"📈 Profit réalisé appliqué au capital alloué : "
+                                f"+{pnl_trade:.4f} → allocated_capital={state['allocated_capital']:.2f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"⚠️ Profit réalisé non appliqué par le CapitalTransitionGuard : "
+                                f"{profit_result.reason}"
+                            )
 
                     _gsl = state["Gsl"]
                     _gsu = state["Gsu"]
