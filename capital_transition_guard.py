@@ -36,17 +36,17 @@ aucune logique metier propre au Guard :
   - aucune connaissance du MetaController, de bot_gateio.py ou de
     Gate.io.
 
-get_current_state et get_history restent volontairement hors
-perimetre de l'etape 6 (non demandes par le flux d'orchestration
-specifie) : ils continuent de lever NotImplementedError, bien que le
-Guard dispose desormais des references necessaires (self._repository,
-self._journal) pour les implementer trivialement lors d'une etape
-ulterieure.
+get_current_state et get_history sont desormais implementees comme
+de pures delegations, respectivement a self._repository.load(bot_id)
+et self._journal.history_for(bot_id). Aucune logique metier n'y a ete
+ajoutee : ce sont des points d'acces publics vers Repository et
+Journal, rien de plus.
 
 Il definit les structures de donnees, la validation pure, la
 resolution pure, le journal logique, le port de persistance, et
-desormais l'orchestrateur complet, tels que specifies par RN-023 et le
-Plan de reconstruction associe.
+desormais l'orchestrateur complet (y compris ses points d'acces en
+lecture), tels que specifies par RN-023 et le Plan de reconstruction
+associe.
 
 Rappel du principe fondamental (RN-023 par.2) :
     Le CapitalTransitionGuard n'est pas un controleur. Il ne pilote
@@ -870,33 +870,44 @@ class CapitalTransitionGuard:
         Lecture seule de l'etat economique courant d'un bot
         (ex: allocated_capital), sans effet de bord.
 
-        Hors perimetre de l'etape 6 : cette methode reste non
-        implementee. Le flux d'orchestration specifie pour cette etape
-        ne porte que sur submit_transition ; get_current_state pourra
-        etre implementee ulterieurement comme simple delegation a
-        self._repository.load(bot_id), sans logique supplementaire.
+        Delegation pure a self._repository.load(bot_id). Aucune
+        logique metier, aucune validation, aucun calcul, aucune
+        modification d'etat : le Guard se contente de transmettre
+        l'appel et de retourner le resultat tel quel.
+
+        Args:
+            bot_id: Identifiant du bot dont on souhaite l'etat courant.
+
+        Returns:
+            L'EconomicState tel que retourne par le Repository.
+
+        Raises:
+            Toute exception levee par self._repository.load() est
+            propagee telle quelle, sans etre capturee ni transformee
+            (ex: FileNotFoundError si aucun etat n'est persiste pour ce
+            bot).
         """
-        raise NotImplementedError(
-            "get_current_state reste hors perimetre de l'etape "
-            "d'orchestration (etape 6) ; a implementer, il s'agirait "
-            "d'une simple delegation a self._repository.load(bot_id)."
-        )
+        return self._repository.load(bot_id)
 
     def get_history(self, bot_id: str) -> list[CapitalTransitionJournalEntry]:
         """
         Consultation de l'historique des transitions d'un bot, pour
         reconstruction et audit (RN-023 par.10, garantie G5).
 
-        Hors perimetre de l'etape 6 : cette methode reste non
-        implementee. Elle pourra etre implementee ulterieurement comme
-        simple delegation a self._journal.history_for(bot_id), sans
-        logique supplementaire.
+        Delegation pure a self._journal.history_for(bot_id). Aucune
+        logique metier, aucun filtrage, aucune transformation : le
+        Guard se contente de transmettre l'appel et de retourner le
+        resultat tel quel.
+
+        Args:
+            bot_id: Identifiant du bot dont on souhaite l'historique.
+
+        Returns:
+            La liste des CapitalTransitionJournalEntry telle que
+            retournee par le Journal (deja une copie defensive,
+            garantie par CapitalTransitionJournal.history_for).
         """
-        raise NotImplementedError(
-            "get_history reste hors perimetre de l'etape d'orchestration "
-            "(etape 6) ; a implementer, il s'agirait d'une simple "
-            "delegation a self._journal.history_for(bot_id)."
-        )
+        return self._journal.history_for(bot_id)
 
     def _reject(self, request: TransitionRequest, reason: str) -> TransitionResult:
         """
