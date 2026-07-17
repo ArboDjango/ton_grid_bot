@@ -30,8 +30,6 @@ from calibration_safety import (
 from startup_sequence import StartupSequence
 from process_synchronization import AtomicJsonStateStore, BotLock, LockUnavailableError
 
-from capital_target import CapitalTargetController
-
 from capital_view import CapitalView, CapitalViewBuilder, compute_capital_view
 
 from capital_transition_guard import (
@@ -1099,9 +1097,6 @@ def format_capital_view(view: CapitalView) -> str:
     lines.append(f"  Alloué       : {view.reference_budget:>8.2f}")
     lines.append(f"  Alpha        : {view.alpha:>+8.2f}")
     lines.append(f"  Grid Budget  : {view.grid_budget:>8.2f}")
-    target_str = f"{view.target_budget:>8.2f}" if view.target_budget is not None else "   None"
-    lines.append(f"  Target       : {target_str}")
-    lines.append(f"  Ratio        : {view.capital_ratio:>8.3f}")
     lines.append(f"  BUY Expo     : {view.buy_exposure:>8.2f}")
     lines.append(f"  SELL Expo    : {view.sell_exposure:>8.2f}")
     lines.append(f"  BUY Gv       : {view.gv_buy:>8.2f}")
@@ -1117,15 +1112,6 @@ def format_capital_view(view: CapitalView) -> str:
 
 def _should_log_info(new_view: CapitalView, prev_view: Optional[CapitalView]) -> bool:
     if prev_view is None:
-        return True
-    if new_view.target_budget != prev_view.target_budget:
-        if new_view.target_budget is None or prev_view.target_budget is None:
-            return True
-        if abs(new_view.target_budget - prev_view.target_budget) > 0.5:
-            return True
-        if prev_view.target_budget > 0 and abs(new_view.target_budget - prev_view.target_budget) / abs(prev_view.target_budget) > 0.005:
-            return True
-    if abs(new_view.capital_ratio - prev_view.capital_ratio) > 0.02:
         return True
     if prev_view.strategic_budget > 0 and abs(new_view.strategic_budget - prev_view.strategic_budget) / abs(prev_view.strategic_budget) > 0.02:
         return True
@@ -1524,8 +1510,6 @@ capital_guard = CapitalTransitionGuard(
     journal=capital_guard_journal,
 )
 
-capital_target_controller = None
-
 # Calibration initiale
 if _CALIBRATE_AVAILABLE and not state.get("grid_ready"):
     try:
@@ -1706,10 +1690,6 @@ last_exposure_state = None
 
 _prev_capital_view = None
 _force_log_event = True
-
-_last_logged_ratio = 1.0
-_last_logged_state = "HOLD"
-_last_logged_target = None
 
 while not _shutdown_requested:
     try:
@@ -1920,8 +1900,12 @@ while not _shutdown_requested:
             last_startup_ws_attempt = time.time()
             start_price_websocket(SYMBOL)
 
-        if ws_running and capital_target_controller is None and startup.reconciliation_done:
-            capital_target_controller = CapitalTargetController(SYMBOL, state_dir=".")
+        if ws_running and not startup.capital_target_active and startup.reconciliation_done:
+            # Étape 9 (suppression de l'intégration CapitalTargetController) :
+            # ces deux flags conditionnent startup.ready ; ils sont conservés
+            # avec le même déclencheur (WS up + réconciliation faite) afin de
+            # ne pas modifier le comportement de démarrage du bot, bien que
+            # CapitalTargetController n'existe plus.
             startup.websocket_connected = True
             startup.capital_target_active = True
             _startup_ready = startup.ready
@@ -1932,55 +1916,14 @@ while not _shutdown_requested:
             time.sleep(LOOP_SLEEP)
             continue
 
-        # Mise à jour du ratio de capital cible
-        capital_target_controller.update(capital_for_grid)
-        capital_ratio = capital_target_controller.get_ratio()
-
-        # ---- Diagnostic CapitalTargetController ----
-        if capital_target_controller is not None:
-            target = capital_target_controller.current_target
-            if target is not None and target > 0:
-                ratio = capital_target_controller.get_ratio()
-                ctrl_state = capital_target_controller.state
-                deadband = capital_target_controller.deadband
-                last_read = capital_target_controller.last_read_time
-                target_age = time.time() - last_read if last_read > 0 else float('inf')
-
-                # Détection de changement significatif
-                changed = (abs(ratio - _last_logged_ratio) > 0.02 or
-                           ctrl_state != _last_logged_state or
-                           target != _last_logged_target)
-
-                if changed:
-                    _last_logged_ratio = ratio
-                    _last_logged_state = ctrl_state
-                    _last_logged_target = target
-
-                    lines = [
-                        "═══════════════════════════════════════",
-                        "CapitalTargetController — DIAGNOSTIC",
-                        "───────────────────────────────────────",
-                        f"Target               : {target:>8.2f}",
-                        f"Target Source        : {capital_target_controller.control_path}",
-                        f"Target Age (s)       : {target_age:>8.1f}",
-                        f"Controlled Value     : {capital_for_grid:>8.2f}  (capital_for_grid)",
-                        f"Wallet réel          : {total_wallet:>8.2f}",
-                        f"Allocated capital    : {state.get('allocated_capital',0.0):>8.2f}",
-                        f"Capital Ratio        : {ratio:>8.3f}",
-                        f"État du contrôleur   : {ctrl_state}",
-                        f"Zone morte           : ±{deadband*100:.0f}%",
-                        f"Écart (target - grid): {capital_for_grid - target:>+8.2f}",
-                        f"Écart (target - wallet): {total_wallet - target:>+8.2f}",
-                        "═══════════════════════════════════════",
-                    ]
-                    logger.info("\n".join(lines))
-
         sell_grid = state["sell_grid"]
         buy_grid = state["buy_grid"]
 
         # TRAITEMENT BUY
         while len(buy_grid) > 0 and price <= buy_grid[0]:
-            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
+            # Étape 8 (désactivation fonctionnelle de CapitalTargetController) :
+            # capital_ratio n'est plus multiplié ici (cf. audit étape 7 et 8).
+            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO
             capital_effectif *= buy_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
                                   state["nu"], state["nl"], state["density_k"])
@@ -2043,7 +1986,9 @@ while not _shutdown_requested:
 
         # TRAITEMENT SELL
         while len(sell_grid) > 0 and price >= sell_grid[0]:
-            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO * capital_ratio
+            # Étape 8 (désactivation fonctionnelle de CapitalTargetController) :
+            # capital_ratio n'est plus multiplié ici (cf. audit étape 7 et 8).
+            capital_effectif = capital_for_grid * ACTIVE_CAPITAL_RATIO
             capital_effectif *= sell_exposure_factor
             Gv_local = compute_gv(capital_effectif, state["P0"], state["Gul"], state["Gll"],
                                   state["nu"], state["nl"], state["density_k"])
@@ -2187,8 +2132,7 @@ while not _shutdown_requested:
                 f"BUY={len(buy_grid)} SELL={len(sell_grid)} | Gv={gv_display:.2f} | k={state['density_k']:.2f} | "
                 f"Trades={state['total_trades']} | PnL réalisé={state.get('total_pnl',0.0):.4f} | UPnL={unrealized_pnl:+.4f} | "
                 f"PnL total={pnl_pct*100:+.2f}% | Stock={inventory_qty:.4f} (moy={avg_cost:.4f}) | "
-                f"Lots={nb_lots} | EMA_B={state.get('ema_slippage_buy',0.0):.4%} EMA_S={state.get('ema_slippage_sell',0.0):.4%} | "
-                f"Ratio CapitalTarget={capital_ratio:.3f}"
+                f"Lots={nb_lots} | EMA_B={state.get('ema_slippage_buy',0.0):.4%} EMA_S={state.get('ema_slippage_sell',0.0):.4%}"
             )
 
         # CAPITALVIEW
@@ -2200,7 +2144,6 @@ while not _shutdown_requested:
                 state=state,
                 price=price,
                 capital_view_aggregates=capital_view_aggregates,
-                capital_target_controller=capital_target_controller,
                 macro_data=macro_data,
                 stress=stress,
                 buy_exposure=buy_exposure_factor,
@@ -2237,8 +2180,6 @@ while not _shutdown_requested:
                 "allocated_capital": capital_view_aggregates["allocated_capital"],
                 "alpha": capital_view_aggregates["alpha"],
                 "capital_for_grid": capital_view_aggregates["capital_for_grid"],
-                "capital_ratio": capital_ratio,
-                "capital_target": capital_target_controller.current_target if capital_target_controller else None,
                 "Gv": state.get("Gv", 0.0),
                 "stress": stress,
                 "adx": macro_data.get("adx", 0.0),

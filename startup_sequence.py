@@ -48,7 +48,6 @@ class StartupSequence:
             "Réconciliation OK\n"
             "Grille initialisée\n"
             "WebSocket connecté\n"
-            "CapitalTargetController actif\n"
             f"Temps d'initialisation : {self.duration:.1f} s\n"
             "================================================="
         )

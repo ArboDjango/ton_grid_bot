@@ -99,10 +99,8 @@ class CapitalView:
     reference_budget: float          # allocated_capital (anciennement capital_usdc)
     alpha: float                     # wallet_balance - reference_budget (performance)
     grid_budget: float
-    target_budget: Optional[float]
 
     strategic_budget: float
-    capital_ratio: float
 
     buy_exposure: float
     sell_exposure: float
@@ -133,7 +131,6 @@ class CapitalViewBuilder:
         state: dict,
         price: float,
         capital_view_aggregates: dict,
-        capital_target_controller,
         macro_data: dict,
         stress: float,
         buy_exposure: float,
@@ -157,19 +154,13 @@ class CapitalViewBuilder:
         alpha = wallet_balance - reference_budget                         # ← NOUVEAU
         grid_budget = capital_view_aggregates.get("capital_for_grid", 0.0)
 
-        target_budget = (
-            capital_target_controller.current_target
-            if capital_target_controller
-            else None
-        )
-        capital_ratio = (
-            capital_target_controller.get_ratio()
-            if capital_target_controller
-            else 1.0
-        )
-
         active_capital_ratio = state.get("ACTIVE_CAPITAL_RATIO", 0.9)
-        strategic_budget = grid_budget * active_capital_ratio * capital_ratio
+        # Étape 9 (suppression de l'intégration CapitalTargetController) :
+        # allocated_capital reflète déjà les corrections du MetaController
+        # via CapitalTransitionGuard (META_CORRECTION) ; aucun facteur de
+        # ratio supplémentaire n'est plus calculé ici (cf. audit étape 7,
+        # désactivation étape 8).
+        strategic_budget = grid_budget * active_capital_ratio
         effective_buy_budget = strategic_budget * buy_exposure
         effective_sell_budget = strategic_budget * sell_exposure
 
@@ -211,9 +202,7 @@ class CapitalViewBuilder:
             reference_budget=reference_budget,
             alpha=alpha,                                                # ← NOUVEAU
             grid_budget=grid_budget,
-            target_budget=target_budget,
             strategic_budget=strategic_budget,
-            capital_ratio=capital_ratio,
             buy_exposure=buy_exposure,
             sell_exposure=sell_exposure,
             effective_buy_budget=effective_buy_budget,
