@@ -34,6 +34,13 @@ from capital_target import CapitalTargetController
 
 from capital_view import CapitalView, CapitalViewBuilder, compute_capital_view
 
+from capital_transition_guard import (
+    CapitalTransitionGuard,
+    CapitalTransitionJournal,
+    TransitionStatus,
+)
+from bot_capital_sync import StateDictEconomicRepository, build_manual_sync_request
+
 from history_logger import HistoryLogger
 history_logger = HistoryLogger()
 
@@ -1500,6 +1507,22 @@ state = load_state()
 startup.state_loaded = True
 journal = TradeJournal(SYMBOL)
 
+# ============================================================
+# CapitalTransitionGuard — premiere integration reelle (RN-022/023)
+# ============================================================
+# Perimetre strictement limite a --sync-capital pour cette etape.
+# Le Repository opere directement sur le state dict deja charge, afin
+# de ne pas introduire une deuxieme source de verite pour
+# allocated_capital tant que le reste du bot (compute_capital_view,
+# CapitalViewBuilder, logs, metriques) continue de lire ce champ
+# directement depuis ce meme state dict.
+capital_guard_repository = StateDictEconomicRepository(state, CURRENT_SYMBOL, save_state)
+capital_guard_journal = CapitalTransitionJournal()
+capital_guard = CapitalTransitionGuard(
+    repository=capital_guard_repository,
+    journal=capital_guard_journal,
+)
+
 capital_target_controller = None
 
 # Calibration initiale
@@ -1575,13 +1598,26 @@ if price0:
         new_allocated = wallet_real - total_pnl - unrealized_pnl
         if new_allocated > 0:
             old_allocated = state.get("allocated_capital", 0.0)
-            state["allocated_capital"] = round(new_allocated, 2)
-            journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "sync_capital")
-            logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
 
-            # Réinitialisation du peak économique (ouvre une nouvelle période)
-            # La sauvegarde est faite à l'intérieur de reset_economic_period
-            reset_economic_period(state, wallet_real, "sync_capital")
+            sync_request = build_manual_sync_request(
+                bot_id=CURRENT_SYMBOL,
+                old_allocated=old_allocated,
+                new_allocated=new_allocated,
+                justification="--sync-capital : recalcul depuis le wallet reel",
+            )
+            sync_result = capital_guard.submit_transition(sync_request)
+
+            if sync_result.status is TransitionStatus.ACCEPTED:
+                # StateDictEconomicRepository.save() a deja mis a jour
+                # state["allocated_capital"] et persiste le state.
+                journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "sync_capital")
+                logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
+
+                # Réinitialisation du peak économique (ouvre une nouvelle période)
+                # La sauvegarde est faite à l'intérieur de reset_economic_period
+                reset_economic_period(state, wallet_real, "sync_capital")
+            else:
+                logger.warning(f"⚠️ Synchronisation refusée par le CapitalTransitionGuard : {sync_result.reason}")
         else:
             logger.warning(f"⚠️ Nouveau capital calculé <= 0 ({new_allocated:.2f}), garde l'ancien.")
 else:
