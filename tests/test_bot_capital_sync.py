@@ -1,10 +1,12 @@
 """
 tests/test_bot_capital_sync.py
 
-Tests couvrant exclusivement la première intégration réelle du
-CapitalTransitionGuard dans bot_gateio.py : le mécanisme --sync-capital,
-via bot_capital_sync.py (StateDictEconomicRepository et
-build_manual_sync_request).
+Tests couvrant la première intégration réelle du CapitalTransitionGuard
+dans bot_gateio.py : le mécanisme --sync-capital, via bot_capital_sync.py
+(StateDictEconomicRepository et build_manual_sync_request), ainsi que le
+correctif transitoire merge_allocated_capital_from_disk (protection
+contre l'écrasement silencieux d'allocated_capital par un save_state()
+routinier, cf. TODO/RN à créer dans bot_gateio.py).
 
 Portée strictement respectée :
   - Aucun test n'importe ou n'exécute bot_gateio.py lui-même (script
@@ -25,7 +27,10 @@ Portée strictement respectée :
         (round(new_allocated, 2)) ;
       * une entrée de journal est bien créée dans le journal du Guard ;
       * l'absence de régression : le state dict n'est pas modifié en
-        dehors du champ allocated_capital.
+        dehors du champ allocated_capital ;
+      * merge_allocated_capital_from_disk adopte correctement la
+        valeur sur disque, ne touche à rien d'autre, et gère les cas
+        limites (disque illisible, champ absent) sans erreur.
 """
 
 import pytest
@@ -39,7 +44,11 @@ from capital_transition_guard import (
     TransitionOrigin,
     TransitionStatus,
 )
-from bot_capital_sync import StateDictEconomicRepository, build_manual_sync_request
+from bot_capital_sync import (
+    StateDictEconomicRepository,
+    build_manual_sync_request,
+    merge_allocated_capital_from_disk,
+)
 
 
 # ============================================================
@@ -340,3 +349,86 @@ class TestManualSyncEndToEnd:
         assert history[0].state_after == EconomicState(allocated_capital=120.0)
         assert history[1].state_after == EconomicState(allocated_capital=90.0)
         assert state["allocated_capital"] == 90.0
+
+
+# ============================================================
+# MERGE_ALLOCATED_CAPITAL_FROM_DISK (correctif transitoire)
+# ============================================================
+
+class TestMergeAllocatedCapitalFromDisk:
+    def test_adopts_the_on_disk_value_when_present(self):
+        # Scenario reproduisant exactement l'incident observe en
+        # production : le state en memoire est obsolete (160.09),
+        # une correction externe (META_CORRECTION) a deja ecrit
+        # 191.86 sur disque entre-temps.
+        state = {"allocated_capital": 160.09}
+        on_disk_state = {"allocated_capital": 191.86}
+
+        merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert state["allocated_capital"] == 191.86
+
+    def test_does_nothing_when_on_disk_state_is_none(self):
+        # Cas du tout premier save (fichier pas encore cree) : ne doit
+        # pas lever d'exception ni modifier state.
+        state = {"allocated_capital": 220.0}
+
+        merge_allocated_capital_from_disk(state, None)
+
+        assert state["allocated_capital"] == 220.0
+
+    def test_does_nothing_when_allocated_capital_absent_from_disk(self):
+        state = {"allocated_capital": 220.0}
+        on_disk_state = {"other_field": "value"}
+
+        merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert state["allocated_capital"] == 220.0
+
+    def test_does_not_touch_other_fields_of_state(self):
+        state = {
+            "allocated_capital": 160.09,
+            "wallet_peak": 500.0,
+            "total_pnl": 12.0,
+            "sell_grid": [1, 2, 3],
+        }
+        on_disk_state = {
+            "allocated_capital": 191.86,
+            "wallet_peak": 999.0,  # ne doit jamais etre adopte par cette fonction
+            "total_pnl": 42.0,      # idem
+        }
+
+        merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert state["allocated_capital"] == 191.86
+        assert state["wallet_peak"] == 500.0
+        assert state["total_pnl"] == 12.0
+        assert state["sell_grid"] == [1, 2, 3]
+
+    def test_adopts_on_disk_value_even_if_it_is_lower(self):
+        # La fonction ne juge pas si la nouvelle valeur est plus
+        # grande ou plus petite : le disque fait autorite, dans les
+        # deux sens.
+        state = {"allocated_capital": 300.0}
+        on_disk_state = {"allocated_capital": 250.0}
+
+        merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert state["allocated_capital"] == 250.0
+
+    def test_is_a_no_op_when_values_already_match(self):
+        state = {"allocated_capital": 220.0}
+        on_disk_state = {"allocated_capital": 220.0}
+
+        merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert state["allocated_capital"] == 220.0
+
+    def test_does_not_return_a_value_mutates_in_place(self):
+        state = {"allocated_capital": 100.0}
+        on_disk_state = {"allocated_capital": 150.0}
+
+        result = merge_allocated_capital_from_disk(state, on_disk_state)
+
+        assert result is None
+        assert state["allocated_capital"] == 150.0

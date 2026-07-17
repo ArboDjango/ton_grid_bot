@@ -28,6 +28,17 @@ proprement dans des tests) afin de rester unitairement testables :
     a 2 decimales, delta signe par rapport a l'ancien), sans dupliquer
     ni modifier ce calcul.
 
+  - merge_allocated_capital_from_disk : PATCH TRANSITOIRE (cf.
+    TODO/RN a creer dans bot_gateio.py, fonction save_state()).
+    Empeche le process bot d'ecraser silencieusement une correction
+    externe d'allocated_capital (MANUAL_SYNC ou META_CORRECTION
+    survenue depuis un autre process) en adoptant la valeur lue sur
+    disque juste avant chaque sauvegarde. Ne resout pas la course
+    critique dans l'absolu (pas de verrouillage inter-processus
+    strict autour du cycle lecture-modification-ecriture), mais
+    elimine le cas observe en production (ecrasement par une valeur
+    figee en memoire depuis le demarrage du bot).
+
 Aucune logique de validation, de resolution ou de decision n'est
 ajoutee ici : ce module se contente de traduire le mecanisme existant
 en une demande de transition conforme au contrat du Guard.
@@ -147,3 +158,45 @@ def build_manual_sync_request(
         value=AbsoluteAmount(amount=delta),
         justification=justification,
     )
+
+
+def merge_allocated_capital_from_disk(
+    state: dict,
+    on_disk_state: "dict | None",
+) -> None:
+    """
+    PATCH TRANSITOIRE — adopte allocated_capital lu sur disque dans
+    `state`, si present, juste avant une sauvegarde.
+
+    Contexte (cf. TODO/RN a creer, cite dans bot_gateio.py :
+    save_state()) : allocated_capital peut desormais etre modifie par
+    un processus tiers (CapitalTransitionGuard sollicite par le
+    MetaController via META_CORRECTION, ou par --sync-capital dans un
+    autre run de ce meme bot) pendant que ce process garde sa propre
+    copie en memoire, chargee une seule fois au demarrage. Sans cette
+    fusion, une sauvegarde ulterieure (calibration, wallet_peak,
+    trade...) ecraserait silencieusement cette correction externe avec
+    l'ancienne valeur memorisee.
+
+    Cette fonction ne resout pas la course critique dans l'absolu (le
+    MetaController pourrait encore ecrire entre la lecture ici et
+    l'ecriture qui suit dans save_state(), en l'absence de
+    verrouillage inter-processus strict autour de ce cycle) : elle
+    elimine le cas dominant observe en production (ecrasement par une
+    valeur figee en memoire depuis le demarrage du bot).
+
+    Fonction pure sur le plan du calcul (mutation de `state` en place,
+    a l'image des autres mutations deja effectuees par save_state()
+    historiquement) : ne lit ni n'ecrit elle-meme sur disque, se
+    contente de fusionner deux dictionnaires deja fournis.
+
+    Args:
+        state: Le state dict du bot, sur le point d'etre sauvegarde.
+            Mute en place si allocated_capital est present dans
+            on_disk_state.
+        on_disk_state: Le contenu actuellement persiste sur disque
+            (typiquement STATE_STORE.read()), ou None si illisible ou
+            absent.
+    """
+    if on_disk_state is not None and "allocated_capital" in on_disk_state:
+        state["allocated_capital"] = on_disk_state["allocated_capital"]

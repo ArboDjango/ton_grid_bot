@@ -37,7 +37,11 @@ from capital_transition_guard import (
     CapitalTransitionJournal,
     TransitionStatus,
 )
-from bot_capital_sync import StateDictEconomicRepository, build_manual_sync_request
+from bot_capital_sync import (
+    StateDictEconomicRepository,
+    build_manual_sync_request,
+    merge_allocated_capital_from_disk,
+)
 from bot_realized_pnl_sync import build_realized_profit_request, build_realized_loss_request
 
 from history_logger import HistoryLogger
@@ -889,6 +893,41 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     state, _ = verify_and_resync_inventory_cost(state)
+
+    # ------------------------------------------------------------------
+    # TODO(RN à créer — "Propriété partagée de l'état économique") :
+    # PATCH TRANSITOIRE, à considérer comme une solution d'attente, pas
+    # comme la résolution définitive du problème.
+    #
+    # Constat : allocated_capital peut désormais être modifié par un
+    # processus tiers (CapitalTransitionGuard, sollicité par le
+    # MetaController via META_CORRECTION, ou par --sync-capital dans un
+    # autre run de ce même bot) pendant que ce process a sa propre copie
+    # en mémoire, chargée une seule fois au démarrage. Sans ce correctif,
+    # n'importe lequel des nombreux appels à save_state() dans la boucle
+    # principale (calibration, wallet_peak, achats, ventes...) écraserait
+    # silencieusement une correction externe avec l'ancienne valeur
+    # mémorisée — observé en production le 17/07/2026 sur EGLDUSDT.
+    #
+    # Ce correctif relit allocated_capital depuis le disque juste avant
+    # d'écrire, et l'adopte comme valeur autoritaire. Il réduit fortement
+    # le risque (élimine le cas observé : écrasement par une valeur figée
+    # depuis le démarrage), mais ne résout pas une véritable course
+    # critique (le MetaController pourrait encore écrire entre cette
+    # lecture et l'écriture qui suit, sans verrouillage inter-processus
+    # strict autour de ce cycle lecture-modification-écriture).
+    #
+    # Solution de moyen terme à spécifier dans une RN dédiée : le bot ne
+    # devrait plus conserver en mémoire, pour toute la durée de son
+    # cycle de vie, les champs dont il n'est pas l'unique propriétaire
+    # (allocated_capital appartient conceptuellement au
+    # CapitalTransitionGuard, pas au state dict du bot) — par exemple en
+    # le lisant via capital_guard.get_current_state() à chaque usage
+    # plutôt qu'en le gardant dans ce dict partagé.
+    # ------------------------------------------------------------------
+    on_disk_state = STATE_STORE.read()
+    merge_allocated_capital_from_disk(state, on_disk_state)
+
     state_copy = state.copy()
     if isinstance(state_copy.get("sell_grid"), SortedGrid):
         state_copy["sell_grid"] = state_copy["sell_grid"].to_list()
