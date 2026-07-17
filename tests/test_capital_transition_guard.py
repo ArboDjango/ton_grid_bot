@@ -515,11 +515,6 @@ class TestCapitalTransitionJournalEntry:
         with pytest.raises(dataclasses.FrozenInstanceError):
             entry.reason = "modifié après coup"
 
-
-# ============================================================
-# SQUELETTE DU CAPITALTRANSITIONGUARD
-# ============================================================
-
 # ============================================================
 # SQUELETTE DU CAPITALTRANSITIONGUARD
 # ============================================================
@@ -530,19 +525,22 @@ class TestCapitalTransitionJournalEntry:
 # donc supprime ici, tel qu'annonce des l'etape 1 de ce fichier : « une
 # methode qui cesse de lever NotImplementedError parce qu'elle a ete
 # implementee fera l'objet d'une suppression deliberee du test
-# correspondant, pas d'un echec silencieux ». get_current_state et
-# get_history restent hors perimetre de l'etape 6 et continuent de
-# lever NotImplementedError ; les tests correspondants sont conserves,
-# adaptes au nouveau constructeur qui exige desormais un repository et
-# un journal (necessaires au fonctionnement de submit_transition).
+# correspondant, pas d'un echec silencieux ».
+#
+# Mise a jour deliberee supplementaire (etape 1 de finalisation de
+# l'API publique, post-etape 6) : get_current_state et get_history
+# sont a leur tour implementees comme de pures delegations. Les tests
+# qui verifiaient NotImplementedError pour ces deux methodes sont
+# supprimes ici, pour la meme raison. Leur comportement reel (simple
+# delegation a Repository/Journal, sans logique metier) est couvert
+# par tests/test_guard_public_accessors.py.
 
 class _NullRepositoryForSkeletonTests:
     """
     Repository factice minimal, utilise uniquement pour construire un
     CapitalTransitionGuard dans les tests de ce fichier qui ne portent
-    pas sur submit_transition. Ne sert jamais reellement de
-    persistance ici : get_current_state/get_history restent non
-    implementees et n'appellent pas ce repository a ce stade.
+    pas sur le comportement reel de get_current_state/get_history
+    (couvert separement dans test_guard_public_accessors.py).
     """
 
     def load(self, bot_id):
@@ -554,8 +552,9 @@ class _NullRepositoryForSkeletonTests:
 
 class TestCapitalTransitionGuardSkeleton:
     """
-    Verifie l'API du Guard et le statut des methodes hors perimetre de
-    l'etape 6 (get_current_state, get_history).
+    Verifie l'API publique du Guard (surface des methodes exposees) et
+    l'absence de memoire d'instance au-dela de ses collaborateurs
+    injectes.
     """
 
     def _make_guard(self):
@@ -572,16 +571,6 @@ class TestCapitalTransitionGuardSkeleton:
 
     def test_exposes_get_history_method(self):
         assert hasattr(CapitalTransitionGuard, "get_history")
-
-    def test_get_current_state_raises_not_implemented_error(self):
-        guard = self._make_guard()
-        with pytest.raises(NotImplementedError):
-            guard.get_current_state("bot_1")
-
-    def test_get_history_raises_not_implemented_error(self):
-        guard = self._make_guard()
-        with pytest.raises(NotImplementedError):
-            guard.get_history("bot_1")
 
     def test_public_api_is_limited_to_the_three_specified_methods(self):
         # Garde-fou structurel : aucune méthode publique
