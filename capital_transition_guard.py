@@ -6,31 +6,47 @@ principes de RN-022 (Budget Strategique Vivant).
 
 Etape 1 du plan de reconstruction : fondations du domaine.
 Etape 2 du plan de reconstruction : validation pure des demandes de
-transition (validate_transition_request), ajoutee dans ce module.
+transition (validate_transition_request).
+Etape 3 du plan de reconstruction : resolution pure des valeurs de
+transition contre un etat economique donne (resolve_transition_value).
+Etape 4 du plan de reconstruction (partielle, perimetre restreint a la
+journalisation logique) : CapitalTransitionJournal, un composant
+d'enregistrement en memoire des CapitalTransitionJournalEntry.
+Etape 6 du plan de reconstruction : CapitalTransitionGuard devient un
+orchestrateur complet de submit_transition, deleguant chaque etape aux
+composants deja construits (validation, resolution, application,
+persistance via EconomicStateRepositoryProtocol, journalisation).
+
+(La persistance elle-meme, EconomicStateRepository, vit dans le module
+economic_state_repository.py, etape 5 du plan de reconstruction — non
+importee ici afin que ce module de domaine reste independant de toute
+infrastructure de fichiers.)
 
 Ce module contient desormais la validation structurelle des
-TransitionRequest, mais ne contient toujours :
-  - aucune persistance ;
-  - aucune resolution des corrections relatives (RelativeCorrection)
-    contre un etat economique reel ;
-  - aucune journalisation effective ;
-  - aucune modification d'etat economique.
+TransitionRequest, la resolution pure d'une TransitionValue en
+AppliedDelta, une fonction pure d'application d'un delta a un etat
+(apply_delta), un journal logique en memoire, un port de persistance
+(EconomicStateRepositoryProtocol) et l'orchestrateur complet
+CapitalTransitionGuard.submit_transition. Ne contiennent toujours
+aucune logique metier propre au Guard :
+  - aucun calcul economique n'est effectue par le Guard lui-meme (tout
+    calcul est delegue a resolve_transition_value et apply_delta) ;
+  - aucune decision de validation n'est prise par le Guard (deleguee a
+    validate_transition_request) ;
+  - aucune connaissance du MetaController, de bot_gateio.py ou de
+    Gate.io.
 
-La validation ajoutee ici est une fonction pure : memes entrees,
-memes sorties, sans effet de bord, sans lecture ni ecriture de
-persistance. Elle ne se prononce que sur la structure et la
-coherence formelle de la demande (cause autorisee, origine
-compatible avec la cause, type de valeur attendu pour la cause,
-champs numeriques finis, justification obligatoire pour
-MANUAL_SYNC). Elle ne resout aucune RelativeCorrection et ne
-determine jamais si une transition doit etre appliquee, tronquee ou
-rejetee au sens de TransitionStatus : ce dernier releve des etapes
-ulterieures (resolution, contraintes locales), qui restent hors
-perimetre de ce module a ce stade.
+get_current_state et get_history restent volontairement hors
+perimetre de l'etape 6 (non demandes par le flux d'orchestration
+specifie) : ils continuent de lever NotImplementedError, bien que le
+Guard dispose desormais des references necessaires (self._repository,
+self._journal) pour les implementer trivialement lors d'une etape
+ulterieure.
 
-Il definit les structures de donnees, le squelette de l'API publique
-du composant, et desormais cette fonction de validation pure, tels
-que specifies par RN-023 et le Plan de reconstruction associe.
+Il definit les structures de donnees, la validation pure, la
+resolution pure, le journal logique, le port de persistance, et
+desormais l'orchestrateur complet, tels que specifies par RN-023 et le
+Plan de reconstruction associe.
 
 Rappel du principe fondamental (RN-023 par.2) :
     Le CapitalTransitionGuard n'est pas un controleur. Il ne pilote
@@ -52,7 +68,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union, Mapping, Any
+from typing import Optional, Union, Mapping, Any, Protocol
 import math
 import time
 
@@ -396,6 +412,134 @@ def validate_transition_request(request: TransitionRequest) -> ValidationOutcome
 
 
 # ============================================================
+# RESOLUTION PURE D'UNE VALEUR DE TRANSITION (ETAPE 3)
+# ============================================================
+#
+# Cette section ne persiste rien, ne journalise rien et n'ecrit aucun
+# etat economique. Elle transforme uniquement une TransitionValue deja
+# structurellement valide en un AppliedDelta concret, contre un
+# EconomicState explicitement fourni par l'appelant.
+
+def resolve_transition_value(
+    value: TransitionValue,
+    current_state: EconomicState,
+) -> AppliedDelta:
+    """
+    Resout une TransitionValue en un AppliedDelta concret.
+
+    Fonction pure : aucun effet de bord, aucune lecture ni ecriture de
+    persistance, aucune journalisation. A entrees identiques, retourne
+    toujours le meme resultat.
+
+    Deux cas, selon le type de `value` :
+      - AbsoluteAmount : deja un montant concret ; resolu tel quel,
+        independamment de `current_state` (un profit realise, une
+        perte realisee ou une synchronisation exceptionnelle ne
+        dependent pas de l'etat courant pour etre resolus).
+      - RelativeCorrection : regle relative, resolue en multipliant sa
+        fraction par `current_state.allocated_capital`. Conformement a
+        la clarification de RN-023, cette resolution s'effectue
+        contre l'EconomicState fourni ici et uniquement celui-ci :
+        c'est a l'appelant de garantir qu'il s'agit bien de l'etat lu
+        au moment de l'application, et non d'un etat fige au moment de
+        l'emission de la demande. Cette fonction ne lit aucun etat par
+        elle-meme et ne met rien en cache.
+
+    Cette fonction ne verifie pas la validite structurelle de `value`
+    (role de validate_transition_request, etape 2) et ne decide pas si
+    le delta resolu sera applique, tronque ou rejete (role des etapes
+    ulterieures : contraintes locales, application par le Guard).
+
+    Args:
+        value: La valeur de transition a resoudre (AbsoluteAmount ou
+            RelativeCorrection).
+        current_state: L'etat economique contre lequel resoudre une
+            eventuelle regle relative.
+
+    Returns:
+        AppliedDelta representant le montant concret resolu.
+
+    Raises:
+        TypeError: si `value` n'est ni un AbsoluteAmount ni un
+            RelativeCorrection. Il ne s'agit pas d'un rejet metier
+            (celui-ci est du ressort de la validation, etape 2) mais
+            d'une erreur de programmation appelant cette fonction en
+            dehors de son contrat.
+    """
+    if isinstance(value, AbsoluteAmount):
+        return AppliedDelta(amount=value.amount)
+
+    if isinstance(value, RelativeCorrection):
+        resolved_amount = value.fraction * current_state.allocated_capital
+        return AppliedDelta(amount=resolved_amount)
+
+    raise TypeError(
+        f"Type de TransitionValue non pris en charge : {type(value).__name__}. "
+        "resolve_transition_value attend un AbsoluteAmount ou un "
+        "RelativeCorrection."
+    )
+
+
+def apply_delta(state: EconomicState, delta: AppliedDelta) -> EconomicState:
+    """
+    Applique un AppliedDelta deja resolu a un EconomicState, produisant
+    le nouvel etat qui en resulte.
+
+    Fonction pure : ne modifie ni `state` ni `delta` (tous deux
+    immuables), ne valide rien, ne decide rien. Elle exprime
+    uniquement, sous forme d'un nouvel EconomicState, la consequence
+    mecanique de l'application d'un delta deja resolu — jamais le
+    calcul de ce delta lui-meme (role de resolve_transition_value) ni
+    la decision de savoir s'il doit etre applique (role des etapes de
+    validation et de contraintes locales).
+
+    Cette fonction existe pour que CapitalTransitionGuard n'ait lui-
+    meme aucune arithmetique a effectuer : l'orchestrateur se contente
+    d'appeler cette fonction, sans jamais manipuler `allocated_capital`
+    directement.
+
+    Args:
+        state: L'etat economique courant.
+        delta: Le delta deja resolu a appliquer.
+
+    Returns:
+        Un nouvel EconomicState reflétant l'application du delta.
+    """
+    return EconomicState(allocated_capital=state.allocated_capital + delta.amount)
+
+
+# ============================================================
+# PORT DE PERSISTANCE (INVERSION DE DEPENDANCE)
+# ============================================================
+#
+# Ce Protocol decrit uniquement l'interface attendue par
+# CapitalTransitionGuard pour la persistance d'EconomicState. Il ne
+# connait aucune implementation concrete : le module de domaine reste
+# ainsi independant de toute infrastructure (aucun import de json,
+# pathlib, os, ou de EconomicStateRepository dans ce fichier). C'est
+# EconomicStateRepository (economic_state_repository.py) qui satisfait
+# structurellement ce Protocol, sans qu'aucun des deux modules n'ait
+# besoin d'importer l'autre au niveau du domaine.
+
+class EconomicStateRepositoryProtocol(Protocol):
+    """
+    Port de persistance attendu par CapitalTransitionGuard.
+
+    Toute implementation fournissant ces deux methodes avec cette
+    signature peut etre injectee dans le Guard, qu'elle vive dans ce
+    projet ou ailleurs.
+    """
+
+    def load(self, bot_id: str) -> EconomicState:
+        """Lit l'EconomicState courant d'un bot."""
+        ...
+
+    def save(self, bot_id: str, state: EconomicState) -> None:
+        """Persiste un EconomicState pour un bot."""
+        ...
+
+
+# ============================================================
 # RESULTAT D'UNE TRANSITION
 # ============================================================
 
@@ -478,7 +622,99 @@ class CapitalTransitionJournalEntry:
 
 
 # ============================================================
+# JOURNAL LOGIQUE (ETAPE 4, PERIMETRE RESTREINT)
+# ============================================================
+#
+# Ce composant ne persiste rien sur disque ou support externe (role
+# reserve au futur Repository). Il ne lit ni ne modifie aucun etat
+# economique. Il ne construit aucune CapitalTransitionJournalEntry :
+# il se contente de recevoir des entrees deja entierement formees et
+# de les rendre consultables par bot, dans leur ordre d'enregistrement.
+
+class CapitalTransitionJournal:
+    """
+    Journal logique, en memoire, des CapitalTransitionJournalEntry.
+
+    Responsabilite unique : enregistrer des entrees deja construites
+    et permettre leur consultation ulterieure par bot (RN-023 par.10,
+    garantie G5 - auditabilite). Ce composant :
+
+      - ne construit aucune entree lui-meme (role des etapes de
+        validation, resolution et decision d'application, qui
+        produisent une CapitalTransitionJournalEntry complete avant
+        de la soumettre a ce journal) ;
+      - ne valide pas le contenu des entrees recues (role de
+        validate_transition_request, etape 2) ;
+      - ne decide rien (aucune notion d'acceptation, de troncature ou
+        de rejet n'est evaluee ici : le journal enregistre indifferemment
+        les trois statuts) ;
+      - ne lit ni ne modifie aucun EconomicState ;
+      - ne persiste rien en dehors de la memoire du processus courant.
+        L'ecriture vers un support durable (fichier JSONL, base, etc.)
+        est le role d'un futur Repository, explicitement hors
+        perimetre de cette etape.
+
+    Ce composant conserve un etat interne (les entrees accumulees),
+    ce qui ne contredit pas la garantie de statelessness du
+    CapitalTransitionGuard (RN-023 par.11, G4) : cette derniere porte
+    sur l'absence de memoire de decision ou de convergence, pas sur
+    l'absence d'un historique append-only, que RN-023 exige au
+    contraire explicitement (par.10).
+    """
+
+    def __init__(self) -> None:
+        self._entries_by_bot: dict[str, list[CapitalTransitionJournalEntry]] = {}
+
+    def record(self, entry: CapitalTransitionJournalEntry) -> None:
+        """
+        Enregistre une entree de journal deja construite.
+
+        Ne modifie ni ne lit aucun EconomicState. N'evalue ni ne
+        transforme le contenu de l'entree : elle est stockee telle
+        quelle, a la suite des entrees deja enregistrees pour le meme
+        bot.
+
+        Args:
+            entry: L'entree deja entierement construite a enregistrer.
+
+        Raises:
+            TypeError: si `entry` n'est pas une instance de
+                CapitalTransitionJournalEntry. Il ne s'agit pas d'un
+                rejet metier mais d'une erreur de programmation
+                appelant cette methode en dehors de son contrat.
+        """
+        if not isinstance(entry, CapitalTransitionJournalEntry):
+            raise TypeError(
+                "CapitalTransitionJournal.record attend une instance de "
+                f"CapitalTransitionJournalEntry, recu : {type(entry).__name__}."
+            )
+        self._entries_by_bot.setdefault(entry.bot_id, []).append(entry)
+
+    def history_for(self, bot_id: str) -> list[CapitalTransitionJournalEntry]:
+        """
+        Retourne l'historique des entrees enregistrees pour un bot,
+        dans leur ordre d'enregistrement.
+
+        Retourne une copie defensive : toute modification de la liste
+        retournee n'affecte pas l'etat interne du journal.
+
+        Args:
+            bot_id: Identifiant du bot dont on souhaite l'historique.
+
+        Returns:
+            Liste des CapitalTransitionJournalEntry enregistrees pour
+            ce bot, dans l'ordre d'enregistrement. Liste vide si aucune
+            entree n'a ete enregistree pour ce bot.
+        """
+        return list(self._entries_by_bot.get(bot_id, []))
+
+
+# ============================================================
 # SQUELETTE DU CAPITALTRANSITIONGUARD
+# ============================================================
+
+# ============================================================
+# CAPITALTRANSITIONGUARD — ORCHESTRATEUR (ETAPE 6)
 # ============================================================
 
 class CapitalTransitionGuard:
@@ -486,42 +722,164 @@ class CapitalTransitionGuard:
     Gardien exclusif des transitions de l'etat economique d'un Grid Bot
     (RN-023).
 
-    Squelette d'etape 1 : aucune methode n'est implementee a ce stade.
-    Aucune logique de validation, de resolution, de persistance ou de
-    journalisation ne doit etre ajoutee avant les etapes suivantes du
-    plan de reconstruction.
+    Ce composant est un pur orchestrateur : il ne contient aucune
+    logique metier propre. Chaque etape du flux (validation,
+    resolution, application, persistance, journalisation) est deleguee
+    a un composant deja construit et deja teste independamment
+    (validate_transition_request, resolve_transition_value,
+    apply_delta, EconomicStateRepositoryProtocol,
+    CapitalTransitionJournal). Le Guard se contente d'appeler ces
+    composants dans le bon ordre et de transporter leurs resultats.
 
-    Rappel des non-responsabilites (RN-023 par.5) : ce composant ne
-    calcule jamais le GOI, ne produit jamais une correction
-    strategique, ne calcule jamais un profit ou une perte, ne decide
-    jamais de la politique economique, ne pilote jamais le
-    portefeuille, ne connait jamais la strategie de trading, ne
-    poursuit jamais une valeur cible, et ne conserve aucun etat de
-    convergence entre deux cycles.
+    Flux de submit_transition, en cas de demande structurellement
+    valide :
+
+        TransitionRequest
+              |
+              v
+        validate_transition_request  (deja teste independamment)
+              |
+              v
+        repository.load              (lecture de l'etat courant)
+              |
+              v
+        resolve_transition_value     (deja teste independamment)
+              |
+              v
+        apply_delta                  (deja teste independamment)
+              |
+              v
+        journal.record               (ecrit AVANT la persistance de
+              |                       l'etat — cf. note sur l'ordre
+              |                       d'ecriture ci-dessous)
+              v
+        repository.save
+              |
+              v
+        TransitionResult
+
+    Si la demande est structurellement invalide, seule la validation
+    et la journalisation ont lieu : ni le Repository ni le Resolver ne
+    sont sollicites (RN-023 : en cas d'echec, aucune modification
+    economique n'est appliquee).
+
+    Note sur l'ordre d'ecriture (journal avant etat) :
+        Le journal est ecrit avant que le nouvel etat ne soit persiste.
+        Si repository.save() echoue apres que journal.record() a
+        reussi, l'entree de journal refletera une transition qui n'a
+        finalement pas ete persistee. Ce risque residuel est connu et
+        assume : il correspond a la decision d'implementation prise
+        lors de la revue de faisabilite de RN-023 (le journal fait foi
+        en cas d'incoherence ; une reconciliation au demarrage,
+        comparant la derniere entree de journal a l'etat persiste,
+        reste a implementer dans une etape ulterieure dediee a la
+        persistance complete). Ce composant ne masque jamais cette
+        situation : si repository.save() leve une exception, elle
+        remonte telle quelle a l'appelant.
+
+    Gestion des erreurs :
+        Le Guard ne capture jamais d'exception. Une erreur levee par
+        repository.load(), resolve_transition_value() ou
+        repository.save() remonte sans etre transformee ni masquee.
+        Seule la validation structurelle (validate_transition_request)
+        produit un resultat REJECTED "normal" (un cas prevu par
+        RN-023, pas une defaillance) ; toute autre erreur signale une
+        situation exceptionnelle (bug, panne d'infrastructure) qui ne
+        doit jamais etre deguisee en resultat metier.
+
+    Rappel des non-responsabilites (RN-023 par.5), inchangees par
+    cette etape : ce composant ne calcule jamais le GOI, ne produit
+    jamais une correction strategique, ne decide jamais de la
+    politique economique, ne pilote jamais le portefeuille, ne connait
+    jamais la strategie de trading, le MetaController, bot_gateio.py ou
+    Gate.io, et ne poursuit jamais une valeur cible.
+
+    Les contraintes locales (troncature d'une correction, planchers
+    economiques) restent hors perimetre de cette etape : seuls les
+    statuts ACCEPTED (transition structurellement valide) et REJECTED
+    (echec de validation) peuvent etre produits ici. TRUNCATED sera
+    introduit lors de l'etape dediee aux contraintes locales.
     """
+
+    def __init__(
+        self,
+        repository: EconomicStateRepositoryProtocol,
+        journal: CapitalTransitionJournal,
+    ) -> None:
+        """
+        Args:
+            repository: Port de persistance d'EconomicState (voir
+                EconomicStateRepositoryProtocol). Toute implementation
+                satisfaisant structurellement ce protocole convient
+                (ex: EconomicStateRepository).
+            journal: Journal logique dans lequel chaque transition
+                traitee est enregistree.
+        """
+        self._repository = repository
+        self._journal = journal
 
     def submit_transition(self, request: TransitionRequest) -> TransitionResult:
         """
         Point d'entree unique de soumission d'une demande de transition
         (RN-023 par.3).
 
-        Etape 1 : non implementee.
+        Orchestration pure : voir le flux decrit dans la docstring de
+        la classe. Aucune decision economique, aucune validation,
+        aucune resolution et aucune ecriture de fichier n'ont lieu dans
+        cette methode elle-meme — toutes sont deleguees aux composants
+        injectes ou importes.
+
+        Args:
+            request: La demande de transition a traiter.
+
+        Returns:
+            Le TransitionResult decrivant l'issue du traitement
+            (ACCEPTED ou REJECTED a ce stade du plan de reconstruction).
+
+        Raises:
+            Toute exception levee par repository.load(),
+            resolve_transition_value() ou repository.save() est
+            propagee telle quelle, sans etre capturee ni transformee.
         """
-        raise NotImplementedError(
-            "submit_transition sera implementee aux etapes suivantes "
-            "du plan de reconstruction (validation, resolution, "
-            "persistance, journalisation, contraintes locales)."
+        validation = validate_transition_request(request)
+        if not validation.is_valid:
+            return self._reject(request, validation.reason)
+
+        current_state = self._repository.load(request.bot_id)
+        applied_delta = resolve_transition_value(request.value, current_state)
+        new_state = apply_delta(current_state, applied_delta)
+
+        result = TransitionResult(
+            status=TransitionStatus.ACCEPTED,
+            requested_value=request.value,
+            applied_value=applied_delta,
+            state_before=current_state,
+            state_after=new_state,
+            reason=None,
         )
+
+        # Le journal est ecrit avant la persistance de l'etat (cf. note
+        # d'ordre d'ecriture dans la docstring de la classe).
+        self._journal.record(self._build_journal_entry(request, result))
+        self._repository.save(request.bot_id, new_state)
+
+        return result
 
     def get_current_state(self, bot_id: str) -> EconomicState:
         """
         Lecture seule de l'etat economique courant d'un bot
         (ex: allocated_capital), sans effet de bord.
 
-        Etape 1 : non implementee.
+        Hors perimetre de l'etape 6 : cette methode reste non
+        implementee. Le flux d'orchestration specifie pour cette etape
+        ne porte que sur submit_transition ; get_current_state pourra
+        etre implementee ulterieurement comme simple delegation a
+        self._repository.load(bot_id), sans logique supplementaire.
         """
         raise NotImplementedError(
-            "get_current_state sera implementee a l'etape de persistance."
+            "get_current_state reste hors perimetre de l'etape "
+            "d'orchestration (etape 6) ; a implementer, il s'agirait "
+            "d'une simple delegation a self._repository.load(bot_id)."
         )
 
     def get_history(self, bot_id: str) -> list[CapitalTransitionJournalEntry]:
@@ -529,8 +887,62 @@ class CapitalTransitionGuard:
         Consultation de l'historique des transitions d'un bot, pour
         reconstruction et audit (RN-023 par.10, garantie G5).
 
-        Etape 1 : non implementee.
+        Hors perimetre de l'etape 6 : cette methode reste non
+        implementee. Elle pourra etre implementee ulterieurement comme
+        simple delegation a self._journal.history_for(bot_id), sans
+        logique supplementaire.
         """
         raise NotImplementedError(
-            "get_history sera implementee a l'etape de persistance/journalisation."
+            "get_history reste hors perimetre de l'etape d'orchestration "
+            "(etape 6) ; a implementer, il s'agirait d'une simple "
+            "delegation a self._journal.history_for(bot_id)."
+        )
+
+    def _reject(self, request: TransitionRequest, reason: str) -> TransitionResult:
+        """
+        Construit et journalise un TransitionResult REJECTED, sans
+        toucher au Repository (RN-023 : un echec de validation
+        n'entraine aucune modification economique).
+
+        Methode privee d'orchestration : ne decide de rien elle-meme,
+        se contente d'assembler le resultat REJECTED a partir du motif
+        deja produit par validate_transition_request, et de le
+        journaliser.
+        """
+        result = TransitionResult(
+            status=TransitionStatus.REJECTED,
+            requested_value=request.value,
+            applied_value=None,
+            state_before=None,
+            state_after=None,
+            reason=reason,
+        )
+        self._journal.record(self._build_journal_entry(request, result))
+        return result
+
+    @staticmethod
+    def _build_journal_entry(
+        request: TransitionRequest,
+        result: TransitionResult,
+    ) -> CapitalTransitionJournalEntry:
+        """
+        Assemble une CapitalTransitionJournalEntry a partir de la
+        demande d'origine et du resultat obtenu.
+
+        Methode privee, purement mecanique : ne decide de rien, ne
+        calcule rien, se contente de recopier les champs deja produits
+        par la demande et par le resultat.
+        """
+        return CapitalTransitionJournalEntry(
+            bot_id=request.bot_id,
+            cause=request.cause,
+            origin=request.origin,
+            status=result.status,
+            requested_value=result.requested_value,
+            applied_value=result.applied_value,
+            state_before=result.state_before,
+            state_after=result.state_after,
+            reason=result.reason,
+            requested_at=request.requested_at,
+            applied_at=result.applied_at,
         )

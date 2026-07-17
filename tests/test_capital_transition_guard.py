@@ -33,6 +33,7 @@ from capital_transition_guard import (
     AbsoluteAmount,
     AppliedDelta,
     CapitalTransitionGuard,
+    CapitalTransitionJournal,
     CapitalTransitionJournalEntry,
     EconomicState,
     RelativeCorrection,
@@ -519,11 +520,49 @@ class TestCapitalTransitionJournalEntry:
 # SQUELETTE DU CAPITALTRANSITIONGUARD
 # ============================================================
 
+# ============================================================
+# SQUELETTE DU CAPITALTRANSITIONGUARD
+# ============================================================
+#
+# Mise a jour deliberee (etape 6) : submit_transition est desormais
+# implementee (orchestrateur complet, cf. test_guard_orchestration.py).
+# Le test qui verifiait NotImplementedError pour submit_transition est
+# donc supprime ici, tel qu'annonce des l'etape 1 de ce fichier : « une
+# methode qui cesse de lever NotImplementedError parce qu'elle a ete
+# implementee fera l'objet d'une suppression deliberee du test
+# correspondant, pas d'un echec silencieux ». get_current_state et
+# get_history restent hors perimetre de l'etape 6 et continuent de
+# lever NotImplementedError ; les tests correspondants sont conserves,
+# adaptes au nouveau constructeur qui exige desormais un repository et
+# un journal (necessaires au fonctionnement de submit_transition).
+
+class _NullRepositoryForSkeletonTests:
+    """
+    Repository factice minimal, utilise uniquement pour construire un
+    CapitalTransitionGuard dans les tests de ce fichier qui ne portent
+    pas sur submit_transition. Ne sert jamais reellement de
+    persistance ici : get_current_state/get_history restent non
+    implementees et n'appellent pas ce repository a ce stade.
+    """
+
+    def load(self, bot_id):
+        raise NotImplementedError("non utilise par ces tests")
+
+    def save(self, bot_id, state):
+        raise NotImplementedError("non utilise par ces tests")
+
+
 class TestCapitalTransitionGuardSkeleton:
     """
-    Vérifie que le squelette du Guard expose exactement l'API attendue
-    et qu'aucune méthode ne contient de logique à l'étape 1.
+    Verifie l'API du Guard et le statut des methodes hors perimetre de
+    l'etape 6 (get_current_state, get_history).
     """
+
+    def _make_guard(self):
+        return CapitalTransitionGuard(
+            repository=_NullRepositoryForSkeletonTests(),
+            journal=CapitalTransitionJournal(),
+        )
 
     def test_exposes_submit_transition_method(self):
         assert hasattr(CapitalTransitionGuard, "submit_transition")
@@ -534,32 +573,24 @@ class TestCapitalTransitionGuardSkeleton:
     def test_exposes_get_history_method(self):
         assert hasattr(CapitalTransitionGuard, "get_history")
 
-    def test_submit_transition_raises_not_implemented_error(self):
-        guard = CapitalTransitionGuard()
-        request = TransitionRequest(
-            bot_id="bot_1",
-            cause=TransitionCause.REALIZED_PROFIT,
-            origin=TransitionOrigin.BOT,
-            value=AbsoluteAmount(amount=1.0),
-        )
-        with pytest.raises(NotImplementedError):
-            guard.submit_transition(request)
-
     def test_get_current_state_raises_not_implemented_error(self):
-        guard = CapitalTransitionGuard()
+        guard = self._make_guard()
         with pytest.raises(NotImplementedError):
             guard.get_current_state("bot_1")
 
     def test_get_history_raises_not_implemented_error(self):
-        guard = CapitalTransitionGuard()
+        guard = self._make_guard()
         with pytest.raises(NotImplementedError):
             guard.get_history("bot_1")
 
     def test_public_api_is_limited_to_the_three_specified_methods(self):
         # Garde-fou structurel : aucune méthode publique
-        # supplémentaire ne doit apparaître à l'étape 1 (ex: pas de
-        # méthode "set_target", "force_value", ou tout équivalent qui
+        # supplémentaire ne doit apparaître (ex: pas de méthode
+        # "set_target", "force_value", ou tout équivalent qui
         # romprait l'unicité du point d'entrée défini par RN-023 §3).
+        # Les méthodes privées d'orchestration (_reject,
+        # _build_journal_entry) sont exclues par construction (préfixe
+        # "_").
         public_methods = {
             name
             for name, member in inspect.getmembers(
@@ -573,13 +604,23 @@ class TestCapitalTransitionGuardSkeleton:
             "get_history",
         }
 
-    def test_guard_instance_has_no_persistent_instance_state_after_construction(self):
-        # Le Guard doit être stateless entre deux cycles (RN-023,
-        # garantie G4). À l'étape 1, une instance fraîchement construite
-        # ne doit porter aucun attribut d'instance (pas de mémoire de
-        # convergence, pas de cache implicite).
-        guard = CapitalTransitionGuard()
-        assert vars(guard) == {}
+    def test_guard_instance_carries_only_its_injected_collaborators(self):
+        # Mise a jour deliberee (etape 6) : le Guard n'est plus
+        # constructible sans argument, puisque submit_transition a
+        # desormais besoin d'un repository et d'un journal pour
+        # fonctionner. La garantie de statelessness (RN-023, G4) ne
+        # porte pas sur l'absence totale d'attributs d'instance — un
+        # orchestrateur a necessairement besoin de reference ses
+        # collaborateurs — mais sur l'absence de toute memoire de
+        # decision ou de convergence au-dela de ces collaborateurs.
+        # Ce test verifie donc que l'instance ne porte, juste apres
+        # construction, que les deux references injectees, et rien
+        # d'autre (pas de cache, pas de ratio, pas de cible).
+        repository = _NullRepositoryForSkeletonTests()
+        journal = CapitalTransitionJournal()
+        guard = CapitalTransitionGuard(repository=repository, journal=journal)
+
+        assert vars(guard) == {"_repository": repository, "_journal": journal}
 
 
 # ============================================================
