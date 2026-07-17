@@ -4,18 +4,33 @@ capital_transition_guard.py
 Modele de donnees du CapitalTransitionGuard (RN-023), conforme aux
 principes de RN-022 (Budget Strategique Vivant).
 
-Etape 1 du plan de reconstruction : fondations du domaine uniquement.
+Etape 1 du plan de reconstruction : fondations du domaine.
+Etape 2 du plan de reconstruction : validation pure des demandes de
+transition (validate_transition_request), ajoutee dans ce module.
 
-Ce module ne contient :
-  - aucune validation ;
+Ce module contient desormais la validation structurelle des
+TransitionRequest, mais ne contient toujours :
   - aucune persistance ;
-  - aucune decision economique ;
-  - aucun calcul ;
-  - aucune journalisation effective.
+  - aucune resolution des corrections relatives (RelativeCorrection)
+    contre un etat economique reel ;
+  - aucune journalisation effective ;
+  - aucune modification d'etat economique.
 
-Il definit uniquement les structures de donnees et le squelette de
-l'API publique du composant, tels que specifies par RN-023 et le
-Plan de reconstruction associe.
+La validation ajoutee ici est une fonction pure : memes entrees,
+memes sorties, sans effet de bord, sans lecture ni ecriture de
+persistance. Elle ne se prononce que sur la structure et la
+coherence formelle de la demande (cause autorisee, origine
+compatible avec la cause, type de valeur attendu pour la cause,
+champs numeriques finis, justification obligatoire pour
+MANUAL_SYNC). Elle ne resout aucune RelativeCorrection et ne
+determine jamais si une transition doit etre appliquee, tronquee ou
+rejetee au sens de TransitionStatus : ce dernier releve des etapes
+ulterieures (resolution, contraintes locales), qui restent hors
+perimetre de ce module a ce stade.
+
+Il definit les structures de donnees, le squelette de l'API publique
+du composant, et desormais cette fonction de validation pure, tels
+que specifies par RN-023 et le Plan de reconstruction associe.
 
 Rappel du principe fondamental (RN-023 par.2) :
     Le CapitalTransitionGuard n'est pas un controleur. Il ne pilote
@@ -38,6 +53,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union, Mapping, Any
+import math
 import time
 
 
@@ -214,6 +230,172 @@ class TransitionRequest:
 
 
 # ============================================================
+# VALIDATION PURE D'UNE DEMANDE DE TRANSITION (ETAPE 2)
+# ============================================================
+#
+# Cette section ne resout aucune RelativeCorrection, ne persiste rien,
+# ne journalise rien et ne modifie aucun etat economique. Elle verifie
+# uniquement que la demande est structurellement coherente, avant
+# qu'une quelconque decision d'application ne soit envisagee.
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """
+    Resultat d'une validation structurelle pure d'une TransitionRequest.
+
+    Ce type est distinct de TransitionStatus : une ValidationOutcome
+    ne se prononce que sur la coherence formelle de la demande (est-
+    elle bien formee ?), jamais sur la decision d'application (sera-
+    t-elle acceptee, tronquee ou rejetee au sens du Guard ?). Cette
+    derniere decision appartient aux etapes ulterieures du plan de
+    reconstruction (resolution, contraintes locales).
+
+    Attributes:
+        is_valid: True si la demande est structurellement valide.
+        reason: Motif du premier echec de validation rencontre.
+            None si is_valid est True.
+    """
+    is_valid: bool
+    reason: Optional[str] = None
+
+
+# Origines compatibles avec chaque cause (RN-023 par.7). Cette table
+# est une donnee de reference statique, pas un calcul ni une decision
+# economique : elle ne fait qu'exprimer sous forme verifiable la regle
+# deja enoncee par RN-023 (une cause n'est legitime que si son origine
+# declaree correspond a l'emetteur autorise pour cette cause).
+_AUTHORIZED_ORIGINS_BY_CAUSE: Mapping[TransitionCause, frozenset]= {
+    TransitionCause.REALIZED_PROFIT: frozenset({TransitionOrigin.BOT}),
+    TransitionCause.REALIZED_LOSS: frozenset({TransitionOrigin.BOT}),
+    TransitionCause.META_CORRECTION: frozenset({TransitionOrigin.META_CONTROLLER}),
+    TransitionCause.MANUAL_SYNC: frozenset({TransitionOrigin.OPERATOR}),
+}
+
+# Type de valeur structurellement attendu pour chaque cause. Un profit
+# ou une perte realises, ainsi qu'une synchronisation exceptionnelle,
+# portent un montant absolu ; une correction strategique porte une
+# regle relative, non resolue a ce stade.
+_EXPECTED_VALUE_TYPE_BY_CAUSE = {
+    TransitionCause.REALIZED_PROFIT: AbsoluteAmount,
+    TransitionCause.REALIZED_LOSS: AbsoluteAmount,
+    TransitionCause.MANUAL_SYNC: AbsoluteAmount,
+    TransitionCause.META_CORRECTION: RelativeCorrection,
+}
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Verifie qu'une valeur est un nombre fini (ni NaN, ni infini)."""
+    if isinstance(value, bool):
+        # bool est une sous-classe d'int en Python ; on l'exclut
+        # explicitement pour eviter qu'un booleen ne soit accepte
+        # silencieusement comme un montant.
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def validate_transition_request(request: TransitionRequest) -> ValidationOutcome:
+    """
+    Valide la coherence structurelle d'une TransitionRequest.
+
+    Fonction pure : aucun effet de bord, aucune lecture ni ecriture de
+    persistance, aucune resolution de RelativeCorrection, aucune
+    journalisation. A entrees identiques, retourne toujours le meme
+    resultat.
+
+    Verifications effectuees, dans cet ordre (la premiere verification
+    en echec determine le motif retourne) :
+        1. bot_id est une chaine non vide (hors espaces).
+        2. cause est bien une instance de TransitionCause.
+        3. origin est bien une instance de TransitionOrigin.
+        4. origin est autorisee pour la cause declaree (RN-023 par.7).
+        5. value est du type structurellement attendu pour cette cause
+           (AbsoluteAmount ou RelativeCorrection selon le cas).
+        6. Le champ numerique porte par value est un nombre fini.
+        7. Si cause == MANUAL_SYNC, justification doit etre une chaine
+           non vide (hors espaces) — la synchronisation exceptionnelle
+           doit toujours etre motivee (RN-022).
+
+    Cette fonction ne determine jamais si la transition doit etre
+    appliquee, tronquee ou rejetee par le Guard (TransitionStatus) :
+    elle etablit seulement si la demande est exploitable par les
+    etapes ulterieures.
+
+    Args:
+        request: La demande de transition a valider.
+
+    Returns:
+        ValidationOutcome(is_valid=True) si toutes les verifications
+        passent, sinon ValidationOutcome(is_valid=False, reason=...)
+        avec le motif du premier echec rencontre.
+    """
+    if not isinstance(request.bot_id, str) or request.bot_id.strip() == "":
+        return ValidationOutcome(
+            is_valid=False,
+            reason="bot_id doit etre une chaine non vide.",
+        )
+
+    if not isinstance(request.cause, TransitionCause):
+        return ValidationOutcome(
+            is_valid=False,
+            reason="cause doit etre une instance de TransitionCause.",
+        )
+
+    if not isinstance(request.origin, TransitionOrigin):
+        return ValidationOutcome(
+            is_valid=False,
+            reason="origin doit etre une instance de TransitionOrigin.",
+        )
+
+    authorized_origins = _AUTHORIZED_ORIGINS_BY_CAUSE[request.cause]
+    if request.origin not in authorized_origins:
+        return ValidationOutcome(
+            is_valid=False,
+            reason=(
+                f"origine '{request.origin.value}' non autorisee pour "
+                f"la cause '{request.cause.value}'."
+            ),
+        )
+
+    expected_value_type = _EXPECTED_VALUE_TYPE_BY_CAUSE[request.cause]
+    if not isinstance(request.value, expected_value_type):
+        return ValidationOutcome(
+            is_valid=False,
+            reason=(
+                f"la cause '{request.cause.value}' requiert une valeur de "
+                f"type {expected_value_type.__name__}."
+            ),
+        )
+
+    if isinstance(request.value, AbsoluteAmount):
+        numeric_value = request.value.amount
+    else:
+        numeric_value = request.value.fraction
+
+    if not _is_finite_number(numeric_value):
+        return ValidationOutcome(
+            is_valid=False,
+            reason="la valeur numerique de la demande doit etre un nombre fini.",
+        )
+
+    if request.cause is TransitionCause.MANUAL_SYNC:
+        if (
+            not isinstance(request.justification, str)
+            or request.justification.strip() == ""
+        ):
+            return ValidationOutcome(
+                is_valid=False,
+                reason=(
+                    "une synchronisation exceptionnelle (MANUAL_SYNC) doit "
+                    "obligatoirement porter une justification non vide."
+                ),
+            )
+
+    return ValidationOutcome(is_valid=True)
+
+
+# ============================================================
 # RESULTAT D'UNE TRANSITION
 # ============================================================
 
@@ -352,4 +534,3 @@ class CapitalTransitionGuard:
         raise NotImplementedError(
             "get_history sera implementee a l'etape de persistance/journalisation."
         )
-
