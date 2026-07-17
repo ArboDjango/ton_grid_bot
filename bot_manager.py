@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from process_synchronization import AtomicJsonStateStore, BotLock
 
+from capital_transition_guard import CapitalTransitionGuard, CapitalTransitionJournal, TransitionStatus
+from meta_capital_sync import BotStateFileEconomicRepository, build_meta_correction_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,28 +233,67 @@ class BotManager:
 
     def apply_transaction(self, symbol: str, new_budget: float) -> Dict[str, Any]:
         """
-        Publie la nouvelle allocation en écrivant le fichier de contrôle.
-        (Anciennement : mettait à jour le service et redémarrait.)
+        Applique une correction strategique de capital via le
+        CapitalTransitionGuard (RN-022/RN-023), TransitionType
+        META_CORRECTION.
+
+        (Anciennement : publiait la cible dans control_{symbol}.json,
+        lu par CapitalTargetController. Desormais : modifie directement
+        allocated_capital dans le fichier d'etat reel du bot, via le
+        Guard, sans passer par un fichier de controle intermediaire.)
         """
-        self.logger.info(f"📤 Publication de la cible pour {symbol} : {new_budget:.2f} USDT")
+        self.logger.info(
+            f"📤 Soumission de la correction stratégique pour {symbol} : {new_budget:.2f} USDT"
+        )
         try:
-            self._write_control_file(symbol, new_budget)
+            descriptor = self.get_descriptor(symbol)
+            if descriptor is None:
+                raise OSError(f"Bot {symbol} introuvable (descriptor None)")
+
+            repository = BotStateFileEconomicRepository(descriptor.state_file, symbol)
+            journal = CapitalTransitionJournal()
+            guard = CapitalTransitionGuard(repository=repository, journal=journal)
+
+            current_state = guard.get_current_state(symbol)
+            old_budget = current_state.allocated_capital
+
+            request = build_meta_correction_request(
+                bot_id=symbol,
+                current_allocated=old_budget,
+                new_budget=new_budget,
+                justification="MetaController : correction stratégique (VirtualTreasuryManager)",
+            )
+            result = guard.submit_transition(request)
+
+            if result.status == TransitionStatus.ACCEPTED:
+                return {
+                    "symbol": symbol,
+                    "success": True,
+                    "new_budget": result.state_after.allocated_capital,
+                    "old_budget": old_budget,
+                    "steps": [{"step": "capital_transition_guard", "status": "OK"}],
+                }
+
+            self.logger.error(
+                f"❌ Correction refusée par le CapitalTransitionGuard pour {symbol}: {result.reason}"
+            )
             return {
                 "symbol": symbol,
-                "success": True,
+                "success": False,
                 "new_budget": new_budget,
-                "old_budget": None,  # inconnu ici
-                "steps": [{"step": "write_control_file", "status": "OK"}],
+                "old_budget": old_budget,
+                "error": result.reason,
+                "steps": [{"step": "capital_transition_guard", "status": "REJECTED", "detail": result.reason}],
             }
         except Exception as e:
-            self.logger.error(f"❌ Échec publication cible pour {symbol}: {e}")
+            self.logger.error(f"❌ Échec soumission correction pour {symbol}: {e}")
             return {
                 "symbol": symbol,
                 "success": False,
                 "new_budget": new_budget,
                 "old_budget": None,
                 "error": str(e),
-                "steps": [{"step": "write_control_file", "status": "FAILED", "detail": str(e)}],
+                "steps": [{"step": "capital_transition_guard", "status": "FAILED", "detail": str(e)}],
             }
 
     # ---------------------------------------------------------------------
