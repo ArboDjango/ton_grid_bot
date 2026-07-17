@@ -40,7 +40,7 @@ from capital_transition_guard import (
     TransitionStatus,
 )
 from bot_capital_sync import StateDictEconomicRepository, build_manual_sync_request
-from bot_realized_pnl_sync import build_realized_profit_request
+from bot_realized_pnl_sync import build_realized_profit_request, build_realized_loss_request
 
 from history_logger import HistoryLogger
 history_logger = HistoryLogger()
@@ -2088,13 +2088,12 @@ while not _shutdown_requested:
                     )
 
                     # ============================================================
-                    # CapitalTransitionGuard — profit realise (RN-022/023)
+                    # CapitalTransitionGuard — profit / perte realises (RN-022/023)
                     # ============================================================
-                    # Perimetre strictement limite a REALIZED_PROFIT pour cette
-                    # etape. Le montant transmis est exactement pnl_trade, deja
-                    # calcule ci-dessus, sans aucune transformation. Le cas
-                    # pnl_trade <= 0 (perte ou trade neutre) n'est pas traite ici
-                    # (REALIZED_LOSS, hors perimetre de cette etape).
+                    # Le montant transmis est exactement pnl_trade, deja calcule
+                    # ci-dessus, sans aucune transformation. pnl_trade == 0 (trade
+                    # strictement neutre) ne declenche aucune des deux branches :
+                    # aucune transition economique n'est necessaire dans ce cas.
                     if pnl_trade > 0:
                         profit_request = build_realized_profit_request(
                             bot_id=CURRENT_SYMBOL,
@@ -2111,6 +2110,23 @@ while not _shutdown_requested:
                             logger.warning(
                                 f"⚠️ Profit réalisé non appliqué par le CapitalTransitionGuard : "
                                 f"{profit_result.reason}"
+                            )
+                    elif pnl_trade < 0:
+                        loss_request = build_realized_loss_request(
+                            bot_id=CURRENT_SYMBOL,
+                            amount=pnl_trade,
+                            justification="Vente exécutée : perte réalisée (FIFO)",
+                        )
+                        loss_result = capital_guard.submit_transition(loss_request)
+                        if loss_result.status is TransitionStatus.ACCEPTED:
+                            logger.info(
+                                f"📉 Perte réalisée appliquée au capital alloué : "
+                                f"{pnl_trade:.4f} → allocated_capital={state['allocated_capital']:.2f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"⚠️ Perte réalisée non appliquée par le CapitalTransitionGuard : "
+                                f"{loss_result.reason}"
                             )
 
                     _gsl = state["Gsl"]
