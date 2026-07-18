@@ -196,7 +196,8 @@ SNAPSHOT_META_KEYS = {"date_reference", "timestamp_reference", "exchange", "cash
 FAILED_COOLDOWN_INITIAL = 3
 FAILED_COOLDOWN_MAX     = 60
 GLOBAL_STOP_LOSS_DD = 0.25
-GLOBAL_STOP_LOSS_PNL = -0.10
+# RN-025 : GLOBAL_STOP_LOSS_PNL supprimee — le STOP_LOSS "PnL total" qui
+# l'utilisait a ete retire (cf. commentaire dans la boucle principale).
 DRAWDOWN_WARNING_THRESHOLD = 0.30
 
 LOCK_ACQUIRE_TIMEOUT = 10.0
@@ -1824,6 +1825,14 @@ while not _shutdown_requested:
 
         inventory_qty = capital_view["inventory_qty"]
         unrealized_pnl = capital_view["unrealized_pnl"]
+        # RN-025 : pnl_pct reste calculé et journalisé à titre de reporting
+        # (écart entre wallet_real et allocated_capital), mais ne conditionne
+        # plus aucun mécanisme de protection — cf. RN-024/RN-025, préambule :
+        # "les mécanismes de protection ne consultent que des métriques du
+        # domaine economic". allocated_capital appartient au domaine pilot
+        # (pilotable par CapitalTransitionGuard via META_CORRECTION), donc
+        # tout indicateur qui en dépend ne peut pas servir de déclencheur de
+        # sécurité sans réintroduire exactement le mélange que RN-024 interdit.
         pnl_pct = capital_view["pnl_pct"]
 
         if drawdown_dd >= GLOBAL_STOP_LOSS_DD:
@@ -1837,17 +1846,15 @@ while not _shutdown_requested:
                 wallet_peak=state["wallet_peak"],
             )
             break
-        if pnl_pct < GLOBAL_STOP_LOSS_PNL:
-            logger.critical(f"🚨 STOP-LOSS (PnL total) : PnL={pnl_pct*100:.2f}% < {GLOBAL_STOP_LOSS_PNL*100:.0f}%")
-            journal.log_stop_loss(
-                reason="drawdown",
-                drawdown=drawdown_dd,
-                pnl_pct=pnl_pct,
-                total_pnl=state.get("total_pnl", 0.0),
-                total_wallet=total_wallet,
-                wallet_peak=state["wallet_peak"],
-            )
-            break
+        # RN-025 : le STOP_LOSS "PnL total" (base sur pnl_pct, donc sur
+        # allocated_capital) a ete supprime. Il se declenchait parfois sans
+        # aucune perte economique reelle, uniquement parce que le
+        # MetaController venait de relever allocated_capital via
+        # META_CORRECTION plus vite que wallet_real ne pouvait suivre
+        # (incident reproduit en production le 18/07/2026). Le STOP_LOSS
+        # drawdown ci-dessus, deja fonde exclusivement sur wallet_real/
+        # wallet_peak (domaine economic), reste l'unique mecanisme de
+        # protection actif.
 
         slip_avg = max(state.get("ema_slippage_buy", 0.0), state.get("ema_slippage_sell", 0.0))
 

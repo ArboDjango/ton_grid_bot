@@ -247,26 +247,48 @@ class VirtualTreasuryManager:
         )
 
         # --- Étape 4 : Lissage avec seuil d'action ---
+        # BUGFIX (18/07/2026) : le seuil d'action (deadband) ci-dessous
+        # peut briser la conservation du capital total — certaines
+        # stratégies sont mises en HOLD (recommended = current) tandis
+        # que d'autres appliquent pleinement le lissage, sans qu'aucune
+        # étape ne revérifie que la somme retombe sur capital_total.
+        # C'est ce qui provoquait l'AssertionError observée en
+        # production (remaining_cash < -EPSILON) une fois plusieurs
+        # stratégies concernées simultanément par ce seuil.
+        raw_recommended_map: Dict[str, float] = {}
+        for s in strategies:
+            current = s.current_budget
+            target = clamped[s.symbol]
+            raw_recommended = current + VirtualTreasuryManager.SMOOTHING_FACTOR * (target - current)
+            raw_delta = raw_recommended - current
+            if abs(raw_delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
+                raw_recommended_map[s.symbol] = current
+            else:
+                raw_recommended_map[s.symbol] = raw_recommended
+
+        # Réconciliation : on réutilise le même mécanisme itératif que
+        # pour les bornes (déjà corrigé ci-dessus) afin de garantir que
+        # la somme des budgets recommandés, après application du seuil
+        # d'action, retombe exactement sur capital_total — ou échoue
+        # explicitement si c'est structurellement impossible.
+        reconciled = VirtualTreasuryManager._apply_bounds_iterative(
+            raw_recommended_map, goi_dict, min_budget, max_budget, capital_total, strategies
+        )
+
         allocations = []
         deltas = []
         for idx, s in enumerate(strategies):
             current = s.current_budget
             target = clamped[s.symbol]
-            raw_recommended = current + VirtualTreasuryManager.SMOOTHING_FACTOR * (target - current)
-            raw_delta = raw_recommended - current
+            recommended = reconciled[s.symbol]
+            delta = recommended - current
 
-            # Application du seuil : si |delta| < MIN_DELTA_ACTION, on ne bouge pas
-            if abs(raw_delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
-                recommended = current
-                delta = 0.0
+            if abs(delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
                 action = AllocationAction.HOLD
+            elif delta > 0:
+                action = AllocationAction.INCREASE
             else:
-                recommended = raw_recommended
-                delta = raw_delta
-                if delta > 0:
-                    action = AllocationAction.INCREASE
-                else:
-                    action = AllocationAction.DECREASE
+                action = AllocationAction.DECREASE
 
             # Calcul des pourcentages
             current_pct = current / capital_total if capital_total > 0 else 0.0
@@ -306,9 +328,6 @@ class VirtualTreasuryManager:
                 estimated_cycles=estimated_cycles,
             ))
             deltas.append(delta)
-        
-        sum_recommended_before = sum(a.recommended_budget for a in allocations)
-        remaining_cash_before = capital_total - sum_recommended_before
         
         # Les budgets recommandés représentent uniquement le capital investi.
         # Le reste demeure en trésorerie libre.
@@ -367,23 +386,36 @@ class VirtualTreasuryManager:
 
         Principe :
             1. Clamper tous les budgets aux bornes.
-            2. Calculer l'écart entre la somme des budgets clamprés et capital_total.
+            2. Calculer l'écart entre la somme des budgets clampés et capital_total.
             3. Redistribuer l'écart uniquement sur les stratégies qui ne sont pas
-               aux bornes (libres), proportionnellement à leurs GOI.
-            4. Répéter jusqu'à convergence (écart nul ou plus de stratégies libres).
+               aux bornes (libres), proportionnellement à leurs GOI ; si aucune
+               stratégie n'est libre, redistribuer également sur toutes, puis
+               reclamper et recalculer l'écart au prochain tour.
+            4. Répéter jusqu'à convergence (écart nul dans la tolérance).
+
+        BUGFIX (18/07/2026) : l'ancienne implémentation sortait de la
+        boucle immédiatement dès qu'aucune stratégie n'était libre
+        (`break`), puis tentait un unique ajustement final suivi d'un
+        reclamp — sans jamais revérifier que ce reclamp ne rompait pas
+        à nouveau la conservation du capital total. Ce défaut ne se
+        manifestait pas tant que le système restait loin de ses
+        bornes ; il devenait visible dès que plusieurs stratégies
+        s'en approchaient simultanément (capital total réduit,
+        free_usdt faible), provoquant l'échec de l'assertion en aval
+        dans compute(). Cette version boucle réellement jusqu'à
+        convergence, et signale explicitement une infaisabilité
+        plutôt que de retourner un résultat incohérent.
+
+        Raises:
+            ValueError: si aucune répartition respectant à la fois les
+                bornes [min_budget, max_budget] et la conservation du
+                capital total n'a pu être trouvée après max_iter
+                itérations (cas dégénéré, par exemple si la somme des
+                planchers min_budget dépasse capital_total).
         """
         budgets = target_budgets.copy()
         symbols = [s.symbol for s in strategies]
-
-        # Pour la redistribution, on utilise les GOI (les GOI ajustés sont déjà dans goi_dict)
-        # On s'assure que les GOI sont positifs
-        total_goi = sum(goi_dict[sym] for sym in symbols)
-        if total_goi <= 0:
-            # Si les GOI sont nuls, on redistribue uniformément
-            # Mais normalement on n'arrive pas ici car goi_total > 0
-            goi_weights = {sym: 1.0 for sym in symbols}
-        else:
-            goi_weights = {sym: goi_dict[sym] / total_goi for sym in symbols}
+        tolerance = VirtualTreasuryManager.EPSILON * max(1.0, capital_total)
 
         max_iter = 100
         for _ in range(max_iter):
@@ -394,8 +426,8 @@ class VirtualTreasuryManager:
             current_sum = sum(budgets[sym] for sym in symbols)
             diff = capital_total - current_sum
 
-            if abs(diff) < VirtualTreasuryManager.EPSILON * max(1.0, capital_total):
-                break
+            if abs(diff) < tolerance:
+                return budgets
 
             # Identifier les libres (non bloqués)
             free_symbols = [
@@ -404,10 +436,12 @@ class VirtualTreasuryManager:
             ]
 
             if not free_symbols:
-                # Aucun libre : on distribue l'écart sur toutes (mais on reclamp après)
+                # Aucune stratégie libre : redistribuer sur toutes,
+                # puis reclamper et réévaluer l'écart au tour suivant
+                # (ne jamais sortir de la boucle sans reconvergence).
                 for sym in symbols:
                     budgets[sym] += diff / len(symbols)
-                break
+                continue
 
             # Redistribution proportionnelle aux GOI des libres
             total_free_goi = sum(goi_dict[sym] for sym in free_symbols)
@@ -420,26 +454,22 @@ class VirtualTreasuryManager:
                     ratio = goi_dict[sym] / total_free_goi
                     budgets[sym] += diff * ratio
 
-        # Reclamper final
+        # max_iter épuisées sans convergence : la contrainte est
+        # infaisable (ex: somme des planchers min_budget > capital_total).
+        # On ne retourne jamais un résultat qui violerait la conservation
+        # du capital total en silence.
         for sym in symbols:
             budgets[sym] = max(min_budget, min(max_budget, budgets[sym]))
-
-        # Ajustement final si la somme n'est pas exacte (tolérance)
         final_sum = sum(budgets[sym] for sym in symbols)
-        if abs(final_sum - capital_total) > VirtualTreasuryManager.EPSILON * max(1.0, capital_total):
-            diff = capital_total - final_sum
-            # Redistribuer proportionnellement aux GOI sur toutes les stratégies
-            total_goi = sum(goi_dict[sym] for sym in symbols)
-            if total_goi > 0:
-                for sym in symbols:
-                    budgets[sym] += diff * (goi_dict[sym] / total_goi)
-            else:
-                for sym in symbols:
-                    budgets[sym] += diff / len(symbols)
-            # Reclamper
-            for sym in symbols:
-                budgets[sym] = max(min_budget, min(max_budget, budgets[sym]))
-
+        if abs(final_sum - capital_total) > tolerance:
+            raise ValueError(
+                "Impossible de répartir capital_total="
+                f"{capital_total:.2f} entre {len(symbols)} stratégies en "
+                f"respectant les bornes [{min_budget:.2f}, {max_budget:.2f}] "
+                f"(somme obtenue={final_sum:.2f}, écart={final_sum - capital_total:+.2f}). "
+                "Vérifier que la somme des planchers min_budget ne dépasse "
+                "pas capital_total, ou ajuster les bornes."
+            )
         return budgets
 
     @staticmethod
