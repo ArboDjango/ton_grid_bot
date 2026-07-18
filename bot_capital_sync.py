@@ -39,6 +39,23 @@ proprement dans des tests) afin de rester unitairement testables :
     elimine le cas observe en production (ecrasement par une valeur
     figee en memoire depuis le demarrage du bot).
 
+  - skip_merge_for_guard_self_write : BUGFIX DU PATCH TRANSITOIRE
+    CI-DESSUS, decouvert en production le 18/07/2026. Le patch de
+    fusion, applique sans distinction a chaque appel de save_state(),
+    ecrasait aussi la propre ecriture du Guard : quand
+    StateDictEconomicRepository.save() appelle save_state() pour
+    persister une transition MANUAL_SYNC/REALIZED_PROFIT/REALIZED_LOSS
+    deja calculee et deja appliquee a `state` en memoire, save_state()
+    relisait le disque (encore l'ancienne valeur, puisque c'est
+    precisement cette ecriture qui doit la remplacer) et l'adoptait a
+    la place de la nouvelle valeur correcte - annulant silencieusement
+    la transition que le Guard venait pourtant d'accepter. Cette
+    fonction encapsule la regle de decision : la fusion ne doit
+    s'appliquer QUE lorsque save_state() est appelee pour une raison
+    independante du Guard (calibration, wallet_peak, etc.), jamais
+    lorsqu'elle est appelee PAR le Guard pour persister sa propre
+    ecriture deja legitime.
+
 Aucune logique de validation, de resolution ou de decision n'est
 ajoutee ici : ce module se contente de traduire le mecanisme existant
 en une demande de transition conforme au contrat du Guard.
@@ -200,3 +217,38 @@ def merge_allocated_capital_from_disk(
     """
     if on_disk_state is not None and "allocated_capital" in on_disk_state:
         state["allocated_capital"] = on_disk_state["allocated_capital"]
+
+
+def apply_disk_merge_unless_guard_write(
+    state: dict,
+    on_disk_state: "dict | None",
+    is_guard_write: bool,
+) -> None:
+    """
+    Applique merge_allocated_capital_from_disk(), sauf lorsque cette
+    sauvegarde est elle-meme l'ecriture legitime du
+    CapitalTransitionGuard (bugfix du 18/07/2026, cf. docstring de
+    module).
+
+    Cette fonction encapsule la seule ligne de decision necessaire :
+    quand `is_guard_write` est vrai, save_state() est appelee par
+    StateDictEconomicRepository.save() pour persister une transition
+    deja calculee et deja appliquee a `state` — la fusion ne doit
+    surtout pas s'executer, sinon elle ecraserait cette ecriture
+    legitime avec l'ancienne valeur encore presente sur disque (c'est
+    precisement cette ecriture qui doit la remplacer). Dans tous les
+    autres cas (calibration, wallet_peak, achats, ventes...),
+    `is_guard_write` est faux et la fusion s'applique normalement,
+    conformement au patch transitoire.
+
+    Args:
+        state: Le state dict du bot, sur le point d'etre sauvegarde.
+        on_disk_state: Le contenu actuellement persiste sur disque, ou
+            None si illisible ou absent.
+        is_guard_write: True si cette sauvegarde est declenchee par
+            StateDictEconomicRepository.save() (donc par le Guard
+            lui-meme) ; False pour tout autre appelant de save_state().
+    """
+    if is_guard_write:
+        return
+    merge_allocated_capital_from_disk(state, on_disk_state)

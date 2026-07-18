@@ -41,6 +41,7 @@ from bot_capital_sync import (
     StateDictEconomicRepository,
     build_manual_sync_request,
     merge_allocated_capital_from_disk,
+    apply_disk_merge_unless_guard_write,
 )
 from bot_realized_pnl_sync import build_realized_profit_request, build_realized_loss_request
 
@@ -891,7 +892,7 @@ def load_state() -> dict:
     defaults["buy_grid"] = SortedGrid(reverse=True)
     return defaults
 
-def save_state(state: dict):
+def save_state(state: dict, skip_capital_merge: bool = False):
     state, _ = verify_and_resync_inventory_cost(state)
 
     # ------------------------------------------------------------------
@@ -917,6 +918,19 @@ def save_state(state: dict):
     # lecture et l'écriture qui suit, sans verrouillage inter-processus
     # strict autour de ce cycle lecture-modification-écriture).
     #
+    # BUGFIX (18/07/2026) : ce même correctif, appliqué sans distinction,
+    # écrasait aussi la propre écriture du CapitalTransitionGuard.
+    # Quand StateDictEconomicRepository.save() appelle save_state() pour
+    # persister une transition déjà calculée et déjà appliquée à `state`
+    # (MANUAL_SYNC/REALIZED_PROFIT/REALIZED_LOSS), la fusion relisait le
+    # disque — encore l'ancienne valeur, puisque c'est précisément cette
+    # écriture qui doit la remplacer — et l'adoptait à la place de la
+    # nouvelle valeur correcte, annulant silencieusement la transition
+    # que le Guard venait pourtant d'accepter (observé en production sur
+    # EGLDUSDT/INJUSDT : les transitions MANUAL_SYNC réussies ne
+    # persistaient jamais réellement). skip_capital_merge=True permet à
+    # ce seul appelant légitime de contourner la fusion.
+    #
     # Solution de moyen terme à spécifier dans une RN dédiée : le bot ne
     # devrait plus conserver en mémoire, pour toute la durée de son
     # cycle de vie, les champs dont il n'est pas l'unique propriétaire
@@ -926,7 +940,7 @@ def save_state(state: dict):
     # plutôt qu'en le gardant dans ce dict partagé.
     # ------------------------------------------------------------------
     on_disk_state = STATE_STORE.read()
-    merge_allocated_capital_from_disk(state, on_disk_state)
+    apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=skip_capital_merge)
 
     state_copy = state.copy()
     if isinstance(state_copy.get("sell_grid"), SortedGrid):
@@ -1542,7 +1556,11 @@ journal = TradeJournal(SYMBOL)
 # allocated_capital tant que le reste du bot (compute_capital_view,
 # CapitalViewBuilder, logs, metriques) continue de lire ce champ
 # directement depuis ce meme state dict.
-capital_guard_repository = StateDictEconomicRepository(state, CURRENT_SYMBOL, save_state)
+capital_guard_repository = StateDictEconomicRepository(
+    state,
+    CURRENT_SYMBOL,
+    lambda s: save_state(s, skip_capital_merge=True),
+)
 capital_guard_journal = CapitalTransitionJournal()
 capital_guard = CapitalTransitionGuard(
     repository=capital_guard_repository,

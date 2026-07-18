@@ -48,6 +48,7 @@ from bot_capital_sync import (
     StateDictEconomicRepository,
     build_manual_sync_request,
     merge_allocated_capital_from_disk,
+    apply_disk_merge_unless_guard_write,
 )
 
 
@@ -432,3 +433,132 @@ class TestMergeAllocatedCapitalFromDisk:
 
         assert result is None
         assert state["allocated_capital"] == 150.0
+
+
+# ============================================================
+# APPLY_DISK_MERGE_UNLESS_GUARD_WRITE (bugfix du 18/07/2026)
+# ============================================================
+
+class TestApplyDiskMergeUnlessGuardWrite:
+    def test_merges_when_not_a_guard_write(self):
+        # Comportement identique a merge_allocated_capital_from_disk
+        # quand is_guard_write=False (cas normal : calibration,
+        # wallet_peak, achats, ventes...).
+        state = {"allocated_capital": 160.09}
+        on_disk_state = {"allocated_capital": 191.86}
+
+        apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=False)
+
+        assert state["allocated_capital"] == 191.86
+
+    def test_does_not_merge_when_it_is_a_guard_write(self):
+        # Reproduit exactement l'incident observe en production le
+        # 18/07/2026 : le Guard vient de calculer et d'appliquer
+        # allocated_capital=153.64 dans `state` (via
+        # StateDictEconomicRepository.save()), mais le disque contient
+        # encore l'ancienne valeur (248.75), puisque c'est precisement
+        # cette ecriture qui doit la remplacer. Sans ce correctif, la
+        # fusion adopterait a tort 248.75 et annulerait la transition.
+        state = {"allocated_capital": 153.64}
+        on_disk_state = {"allocated_capital": 248.75}
+
+        apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=True)
+
+        assert state["allocated_capital"] == 153.64
+
+    def test_guard_write_flag_takes_priority_even_if_disk_value_differs_a_lot(self):
+        state = {"allocated_capital": 10.0}
+        on_disk_state = {"allocated_capital": 99999.0}
+
+        apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=True)
+
+        assert state["allocated_capital"] == 10.0
+
+    def test_non_guard_write_still_handles_disk_none_gracefully(self):
+        state = {"allocated_capital": 220.0}
+
+        apply_disk_merge_unless_guard_write(state, None, is_guard_write=False)
+
+        assert state["allocated_capital"] == 220.0
+
+    def test_guard_write_ignores_on_disk_state_entirely_even_if_none(self):
+        state = {"allocated_capital": 153.64}
+
+        apply_disk_merge_unless_guard_write(state, None, is_guard_write=True)
+
+        assert state["allocated_capital"] == 153.64
+
+    def test_returns_none_mutates_in_place(self):
+        state = {"allocated_capital": 100.0}
+        on_disk_state = {"allocated_capital": 150.0}
+
+        result = apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=False)
+
+        assert result is None
+        assert state["allocated_capital"] == 150.0
+
+
+class TestManualSyncSurvivesItsOwnPersistence:
+    """
+    Test de regression bout-en-bout reproduisant le scenario exact de
+    l'incident de production (18/07/2026) : une transition MANUAL_SYNC
+    acceptee par le Guard doit reellement persister, meme lorsque la
+    fonction de sauvegarde applique par ailleurs le patch transitoire
+    de fusion (merge_allocated_capital_from_disk) pour tout appel
+    independant du Guard.
+    """
+
+    def test_accepted_sync_is_not_erased_by_a_save_state_that_respects_the_guard_flag(self):
+        # Simule un save_state() réaliste : applique la fusion sauf
+        # quand on lui dit explicitement qu'il s'agit d'une écriture
+        # du Guard — exactement le contrat introduit par le bugfix.
+        disk = {"allocated_capital": 220.0}
+
+        def fake_save_state(s, skip_capital_merge=False):
+            apply_disk_merge_unless_guard_write(s, dict(disk), is_guard_write=skip_capital_merge)
+            disk["allocated_capital"] = s["allocated_capital"]
+
+        state = {"allocated_capital": 220.0}
+        repository = StateDictEconomicRepository(
+            state, "bot_1", save_fn=lambda s: fake_save_state(s, skip_capital_merge=True)
+        )
+        guard = CapitalTransitionGuard(repository=repository, journal=CapitalTransitionJournal())
+
+        request = build_manual_sync_request(
+            bot_id="bot_1", old_allocated=220.0, new_allocated=248.75, justification="x"
+        )
+        result = guard.submit_transition(request)
+
+        assert result.status is TransitionStatus.ACCEPTED
+        assert state["allocated_capital"] == pytest.approx(248.75)
+        assert disk["allocated_capital"] == pytest.approx(248.75)
+
+    def test_reproduces_the_bug_when_guard_flag_is_not_respected(self):
+        # Contre-exemple : si save_fn ne signale jamais is_guard_write
+        # (l'ancien comportement bugue), la transition acceptee par le
+        # Guard est silencieusement annulee — exactement l'incident
+        # observe en production.
+        disk = {"allocated_capital": 220.0}
+
+        def buggy_save_state(s):
+            # Ancien comportement : fusion inconditionnelle.
+            apply_disk_merge_unless_guard_write(s, dict(disk), is_guard_write=False)
+            disk["allocated_capital"] = s["allocated_capital"]
+
+        state = {"allocated_capital": 220.0}
+        repository = StateDictEconomicRepository(
+            state, "bot_1", save_fn=lambda s: buggy_save_state(s)
+        )
+        guard = CapitalTransitionGuard(repository=repository, journal=CapitalTransitionJournal())
+
+        request = build_manual_sync_request(
+            bot_id="bot_1", old_allocated=220.0, new_allocated=248.75, justification="x"
+        )
+        result = guard.submit_transition(request)
+
+        # Le Guard rapporte bien un succes...
+        assert result.status is TransitionStatus.ACCEPTED
+        assert result.state_after.allocated_capital == pytest.approx(248.75)
+        # ...mais la persistance reelle a ete silencieusement annulee :
+        # c'est exactement le bug reproduit, pour non-regression future.
+        assert state["allocated_capital"] == 220.0
