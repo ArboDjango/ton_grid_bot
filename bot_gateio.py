@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconcile", action="store_true",
                         help="Réconcilier l'inventaire et les ordres ouverts (ne modifie pas le capital stratégique)")
     parser.add_argument("--sync-capital", action="store_true",
-                        help="Recalcule allocated_capital à partir du wallet réel, conserve l'historique (FIFO, PnL, peak)")
+                        help="Aligne allocated_capital sur la valeur de l'inventaire réel, hors cash USDT partagé")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Niveau de log (défaut: INFO)")
@@ -440,12 +440,12 @@ class TradeJournal:
         })
         self._write(entry)
 
-    def log_capital_sync(self, old_allocated: float, new_allocated: float, wallet_real: float, reason: str):
+    def log_capital_sync(self, old_allocated: float, new_allocated: float, economic_value: float, reason: str):
         entry = self._base("CAPITAL_SYNC")
         entry.update({
             "old_allocated": round(old_allocated, 2),
             "new_allocated": round(new_allocated, 2),
-            "wallet_real": round(wallet_real, 2),
+            "economic_value": round(economic_value, 2),
             "reason": reason,
         })
         self._write(entry)
@@ -1502,7 +1502,7 @@ while not macro_data:
 price0 = get_ws_price()
 if price0:
     # Réconcilier l'inventaire si demandé
-    if AUTO_RECONCILE:
+    if AUTO_RECONCILE or SYNC_CAPITAL:
         reconcile_inventory(state, price0)
     # Sauvegarder après réconciliation
     save_state(state)
@@ -1511,24 +1511,15 @@ if price0:
     # GESTION DE --sync-capital (après réconciliation)
     # ============================================================
     if SYNC_CAPITAL:
-        # Récupérer les soldes réels à jour
-        quote_bal, base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
-        wallet_real = quote_bal + base_bal * price0
-
-        # Calculer unrealized_pnl à partir du FIFO existant
-        unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price0)
-        total_pnl = state.get("total_pnl", 0.0)
-
-        # Nouveau capital alloué
-        new_allocated = wallet_real - total_pnl - unrealized_pnl
-        if new_allocated > 0:
-            old_allocated = state.get("allocated_capital", 0.0)
-            state["allocated_capital"] = round(new_allocated, 2)
-            journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "manual_sync")
-            logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
-            save_state(state)
-        else:
-            logger.warning(f"⚠️ Nouveau capital calculé <= 0 ({new_allocated:.2f}), garde l'ancien.")
+        # RN-026 : le cash de cotation est partagé entre les bots.  Il ne
+        # peut donc pas être attribué à chacun d'eux. reconcile_inventory()
+        # ci-dessus a d'abord aligné les lots FIFO avec le solde BASE réel.
+        new_allocated = inv_mgr.inventory_value(state, price0)
+        old_allocated = state.get("allocated_capital", 0.0)
+        state["allocated_capital"] = round(new_allocated, 2)
+        journal.log_capital_sync(old_allocated, state["allocated_capital"], new_allocated, "manual_sync_inventory")
+        logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (inventaire réel, cash partagé exclu)")
+        save_state(state)
 else:
     total_wallet0 = 0.0
     logger.warning("⚠️ Impossible de réconcilier l'inventaire au démarrage (prix manquant)")

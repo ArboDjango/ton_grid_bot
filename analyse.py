@@ -365,6 +365,10 @@ def compute_metrics(state: dict, price: float, symbol: str, exchange_name: str,
         "inventory_qty": economic["inventory_qty"],
         "inventory_cost": economic["inventory_cost"],
         "inventory_value": economic["inventory_value"],
+        # RN-026 : valeur économique propre à cette stratégie.  Le solde de
+        # cotation est partagé entre les bots et ne doit donc jamais être
+        # inclus ici (il est compté une seule fois par le MetaController).
+        "strategy_economic_value": economic["inventory_value"],
         "pnl_latent": economic["unrealized_pnl"],
         "alpha": alpha,
         "alpha_pct": alpha_pct,
