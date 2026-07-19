@@ -97,7 +97,19 @@ class CapitalView:
 
     wallet_balance: float
     reference_budget: float          # allocated_capital (anciennement capital_usdc)
-    alpha: float                     # wallet_balance - reference_budget (performance)
+    alpha: float                     # wallet_balance - reference_budget
+                                      # RN-024/025 : indicateur "bridge" (economic × pilot),
+                                      # plus une mesure de performance depuis que
+                                      # REALIZED_PROFIT/LOSS créditent allocated_capital
+                                      # en meme temps que wallet_real. Represente
+                                      # aujourd'hui un ecart entre l'etat economique
+                                      # reel et la consigne de pilotage courante — pas
+                                      # une performance cumulee. Voir aussi
+                                      # unrealized_pnl (PnL latent), affiche separement.
+    unrealized_pnl: float             # PnL latent (inventaire non realise), domaine
+                                      # economic — grandeur distincte d'alpha, presentee
+                                      # sur une ligne separee (pas de decomposition
+                                      # d'alpha en fonction de cette valeur).
     grid_budget: float
 
     strategic_budget: float
@@ -152,6 +164,7 @@ class CapitalViewBuilder:
         wallet_balance = capital_view_aggregates["total_wallet"]          # wallet_real
         reference_budget = state.get("allocated_capital", 0.0)            # ← MODIFIÉ : allocated_capital
         alpha = wallet_balance - reference_budget                         # ← NOUVEAU
+        unrealized_pnl = capital_view_aggregates.get("unrealized_pnl", 0.0)
         grid_budget = capital_view_aggregates.get("capital_for_grid", 0.0)
 
         active_capital_ratio = state.get("ACTIVE_CAPITAL_RATIO", 0.9)
@@ -201,6 +214,7 @@ class CapitalViewBuilder:
             wallet_balance=wallet_balance,
             reference_budget=reference_budget,
             alpha=alpha,                                                # ← NOUVEAU
+            unrealized_pnl=unrealized_pnl,
             grid_budget=grid_budget,
             strategic_budget=strategic_budget,
             buy_exposure=buy_exposure,
