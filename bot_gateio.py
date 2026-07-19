@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconcile", action="store_true",
                         help="Réconcilier l'inventaire et les ordres ouverts (ne modifie pas le capital stratégique)")
     parser.add_argument("--sync-capital", action="store_true",
-                        help="Recalcule allocated_capital à partir du wallet réel, conserve l'historique (FIFO, PnL, peak)")
+                        help="Aligne allocated_capital sur la valeur de l'inventaire réel, hors cash USDT partagé")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Niveau de log (défaut: INFO)")
@@ -452,12 +452,12 @@ class TradeJournal:
         })
         self._write(entry)
 
-    def log_capital_sync(self, old_allocated: float, new_allocated: float, wallet_real: float, reason: str):
+    def log_capital_sync(self, old_allocated: float, new_allocated: float, economic_value: float, reason: str):
         entry = self._base("CAPITAL_SYNC")
         entry.update({
             "old_allocated": round(old_allocated, 2),
             "new_allocated": round(new_allocated, 2),
-            "wallet_real": round(wallet_real, 2),
+            "economic_value": round(economic_value, 2),
             "reason": reason,
         })
         self._write(entry)
@@ -1609,7 +1609,7 @@ while not macro_data:
 price0 = get_ws_price()
 if price0:
     # Réconcilier l'inventaire si demandé
-    if AUTO_RECONCILE:
+    if AUTO_RECONCILE or SYNC_CAPITAL:
         reconcile_inventory(state, price0)
     # Sauvegarder après réconciliation
     save_state(state)
@@ -1618,52 +1618,17 @@ if price0:
     # GESTION DE --sync-capital (après réconciliation)
     # ============================================================
     if SYNC_CAPITAL:
-        # Récupérer les soldes réels à jour
-        quote_bal, base_bal = exchange.get_balances(QUOTE_ASSET, BASE_ASSET)
 
-        # Lecture pure du CapitalView.
-        # update_peak=False est indispensable ici : nous devons connaître
-        # wallet_real AVANT d'ouvrir une nouvelle période économique,
-        # sans modifier le High Water Mark historique.
-        capital_view = compute_capital_view(
-            state,
-            price0,
-            quote_bal,
-            base_bal,
-            update_peak=False,
-        )
-        wallet_real = capital_view["wallet_real"]
+        # RN-026 : le cash de cotation est partagé entre les bots.  Il ne
+        # peut donc pas être attribué à chacun d'eux. reconcile_inventory()
+        # ci-dessus a d'abord aligné les lots FIFO avec le solde BASE réel.
+        new_allocated = inv_mgr.inventory_value(state, price0)
+        old_allocated = state.get("allocated_capital", 0.0)
+        state["allocated_capital"] = round(new_allocated, 2)
+        journal.log_capital_sync(old_allocated, state["allocated_capital"], new_allocated, "manual_sync_inventory")
+        logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (inventaire réel, cash partagé exclu)")
+        save_state(state)
 
-        # Calculer unrealized_pnl à partir du FIFO existant
-        unrealized_pnl = inv_mgr.inventory_unrealized_pnl(state, price0)
-        total_pnl = state.get("total_pnl", 0.0)
-
-        # Nouveau capital alloué
-        new_allocated = wallet_real - total_pnl - unrealized_pnl
-        if new_allocated > 0:
-            old_allocated = state.get("allocated_capital", 0.0)
-
-            sync_request = build_manual_sync_request(
-                bot_id=CURRENT_SYMBOL,
-                old_allocated=old_allocated,
-                new_allocated=new_allocated,
-                justification="--sync-capital : recalcul depuis le wallet reel",
-            )
-            sync_result = capital_guard.submit_transition(sync_request)
-
-            if sync_result.status is TransitionStatus.ACCEPTED:
-                # StateDictEconomicRepository.save() a deja mis a jour
-                # state["allocated_capital"] et persiste le state.
-                journal.log_capital_sync(old_allocated, state["allocated_capital"], wallet_real, "sync_capital")
-                logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (wallet réel={wallet_real:.2f})")
-
-                # Réinitialisation du peak économique (ouvre une nouvelle période)
-                # La sauvegarde est faite à l'intérieur de reset_economic_period
-                reset_economic_period(state, wallet_real, "sync_capital")
-            else:
-                logger.warning(f"⚠️ Synchronisation refusée par le CapitalTransitionGuard : {sync_result.reason}")
-        else:
-            logger.warning(f"⚠️ Nouveau capital calculé <= 0 ({new_allocated:.2f}), garde l'ancien.")
 else:
     total_wallet0 = 0.0
     logger.warning("⚠️ Impossible de réconcilier l'inventaire au démarrage (prix manquant)")

@@ -12,7 +12,11 @@ ordre et ne consomme aucune ressource de trading. Il produit uniquement des
 recommandations d'allocation.
 
 Le capital total est recalculé dynamiquement à chaque exécution comme :
-    capital_total = solde USDT libre + somme des budgets actuels de toutes les stratégies
+    capital_total = solde USDT libre + somme des valeurs économiques des inventaires
+
+Les valeurs fournies dans StrategyState ne sont jamais des consignes de
+pilotage (allocated_capital). Le solde USDT libre, partagé entre les bots, est
+donc compté exactement une fois.
 
 Le moteur est conçu pour fonctionner avec un nombre variable de stratégies.
 
@@ -60,7 +64,8 @@ class StrategyState:
 
     Attributes:
         symbol: Symbole de la stratégie.
-        current_budget: Budget actuel alloué à la stratégie (en USDT).
+        current_budget: Valeur économique actuelle de l'inventaire de la
+            stratégie (en USDT), hors cash partagé.
         goi: Grid Opportunity Index calculé pour cette stratégie (dans [0, 1]).
         decision: Décision stratégique (DecisionResult ou autre). Optionnel, peut être None.
     """
@@ -110,7 +115,7 @@ class TreasurySummary:
     Résumé global de la trésorerie virtuelle.
 
     Attributes:
-        capital_total: Capital total disponible (USDT libre + budgets actuels).
+        capital_total: Capital économique total (USDT libre + inventaires).
         free_usdt: Solde USDT libre sur le compte Spot.
         total_recommended: Somme des budgets recommandés.
         mean_goi: Moyenne des GOI (après rendements décroissants éventuels).

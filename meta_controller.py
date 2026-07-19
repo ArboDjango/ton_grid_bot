@@ -199,7 +199,21 @@ class MetaController:
                     None if decision_result.valid else msg
                 ))
 
-                current_budget = observation.get("capital_usdc", 0.0)
+                # RN-026 : allocated_capital/capital_usdc est une consigne de
+                # pilotage, pas une richesse.  La valeur de la stratégie est
+                # son inventaire réel ; le cash partagé est ajouté une seule
+                # fois plus bas via free_usdt.
+                current_budget = observation.get("strategy_economic_value")
+                if current_budget is None:
+                    raise ValueError(
+                        f"Valeur économique absente pour {symbol} "
+                        "(strategy_economic_value)"
+                    )
+                current_budget = float(current_budget)
+                if current_budget < 0:
+                    raise ValueError(
+                        f"Valeur économique négative pour {symbol}: {current_budget}"
+                    )
                 goi_value = goi_result.value if goi_result.valid else 0.0
                 strategies.append(StrategyState(
                     symbol=symbol,
