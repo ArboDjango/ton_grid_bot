@@ -824,11 +824,15 @@ def migrate_old_state(state: dict) -> dict:
 
     # Migration capital_usdc -> allocated_capital
     if "capital_usdc" in state and "allocated_capital" not in state:
+        old_allocated = state.get("allocated_capital", 0.0)
         state["allocated_capital"] = state["capital_usdc"]
+        logger.info("[SET] allocated_capital %.2f -> %.2f", old_allocated, state["allocated_capital"])
         logger.info("🔄 Migration : capital_usdc -> allocated_capital")
         migrated = True
     elif "allocated_capital" not in state:
+        old_allocated = state.get("allocated_capital", 0.0)
         state["allocated_capital"] = 0.0
+        logger.info("[SET] allocated_capital %.2f -> %.2f", old_allocated, state["allocated_capital"])
 
     if migrated:
         logger.info("✅ Migration d'état effectuée")
@@ -866,6 +870,7 @@ def load_state() -> dict:
         persisted_state = STATE_STORE.read()
         if persisted_state is not None:
             state = {**defaults, **persisted_state}
+            logger.info("[STATE] state remplacé")
             state = migrate_old_state(state)
 
             state, corrected = verify_and_resync_inventory_cost(state)
@@ -894,6 +899,7 @@ def load_state() -> dict:
     return defaults
 
 def save_state(state: dict, skip_capital_merge: bool = False):
+    logger.info("[SAVE] allocated_capital=%.2f", state["allocated_capital"])
     state, _ = verify_and_resync_inventory_cost(state)
 
     # ------------------------------------------------------------------
@@ -940,8 +946,11 @@ def save_state(state: dict, skip_capital_merge: bool = False):
     # le lisant via capital_guard.get_current_state() à chaque usage
     # plutôt qu'en le gardant dans ce dict partagé.
     # ------------------------------------------------------------------
+    allocated_before_merge = state["allocated_capital"]
     on_disk_state = STATE_STORE.read()
     apply_disk_merge_unless_guard_write(state, on_disk_state, is_guard_write=skip_capital_merge)
+    if state["allocated_capital"] != allocated_before_merge:
+        logger.info("[SET] allocated_capital %.2f -> %.2f", allocated_before_merge, state["allocated_capital"])
 
     state_copy = state.copy()
     if isinstance(state_copy.get("sell_grid"), SortedGrid):
@@ -1624,10 +1633,31 @@ if price0:
         # ci-dessus a d'abord aligné les lots FIFO avec le solde BASE réel.
         new_allocated = inv_mgr.inventory_value(state, price0)
         old_allocated = state.get("allocated_capital", 0.0)
-        state["allocated_capital"] = round(new_allocated, 2)
-        journal.log_capital_sync(old_allocated, state["allocated_capital"], new_allocated, "manual_sync_inventory")
-        logger.info(f"🔄 Capital synchronisé : {old_allocated:.2f} → {state['allocated_capital']:.2f} (inventaire réel, cash partagé exclu)")
-        save_state(state)
+        sync_request = build_manual_sync_request(
+            bot_id=CURRENT_SYMBOL,
+            old_allocated=old_allocated,
+            new_allocated=new_allocated,
+            justification="Synchronisation manuelle sur l'inventaire réel",
+        )
+        sync_result = capital_guard.submit_transition(sync_request)
+        if sync_result.status is TransitionStatus.ACCEPTED:
+            synced_allocated = sync_result.state_after.allocated_capital
+            journal.log_capital_sync(
+                old_allocated,
+                synced_allocated,
+                new_allocated,
+                "manual_sync_inventory",
+            )
+            logger.info(
+                f"🔄 Capital synchronisé : {old_allocated:.2f} → "
+                f"{synced_allocated:.2f} "
+                "(inventaire réel, cash partagé exclu)"
+            )
+        else:
+            logger.warning(
+                "⚠️ Synchronisation du capital refusée par le "
+                f"CapitalTransitionGuard : {sync_result.reason}"
+            )
 
 else:
     total_wallet0 = 0.0
@@ -1653,7 +1683,14 @@ if state.get("allocated_capital", 0.0) <= 0:
                     new_capital = fresh_state.get("allocated_capital", 0.0)
                     if new_capital > 0:
                         # Mettre à jour le state courant
+                        allocated_before_update = state.get("allocated_capital", 0.0)
                         state.update(fresh_state)
+                        if state.get("allocated_capital", 0.0) != allocated_before_update:
+                            logger.info(
+                                "[SET] allocated_capital %.2f -> %.2f",
+                                allocated_before_update,
+                                state["allocated_capital"],
+                            )
                         wait_duration = now - _wait_start_time
                         logger.info(f"💰 Budget stratégique reçu : {new_capital:.2f} {QUOTE_ASSET}")
                         logger.info(f"⏳ Temps d'attente total : {wait_duration:.1f}s")
