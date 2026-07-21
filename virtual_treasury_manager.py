@@ -153,6 +153,36 @@ class VirtualTreasuryResult:
     allocations: List[AllocationResult]
 
 
+class TreasuryReconciliationError(ValueError):
+    """
+    Levée par VirtualTreasuryManager._reconcile_deltas() lorsqu'aucune
+    solution ne permet de satisfaire simultanément les invariants I1-I3
+    de RN-028 (conservation du signe, conservation du capital, respect
+    des bornes) — cas d'infaisabilité structurelle (ex : toutes les
+    stratégies concernées par un même sens de correction sont déjà
+    saturées à leur borne, et le résidu à absorber dépasse ce qu'elles
+    peuvent encore encaisser).
+
+    Conformément à RN-028 (I4), cette exception est explicite plutôt
+    que de laisser _reconcile_deltas() retourner silencieusement un
+    résultat qui violerait l'un de ces invariants.
+
+    Attributes:
+        residual: Écart de capital non résolu au moment de l'échec
+            (capital_total - somme des budgets après la tentative de
+            réconciliation).
+        saturation: Diagnostic par stratégie. Pour chaque symbole
+            concerné, un dict {"delta": ..., "lo": ..., "hi": ...}
+            indiquant le delta atteint et l'intervalle qui le contraint
+            (cf. contrat de _reconcile_deltas()).
+    """
+
+    def __init__(self, message: str, residual: float, saturation: Dict[str, Dict[str, float]]):
+        super().__init__(message)
+        self.residual = residual
+        self.saturation = saturation
+
+
 # -------------------------------------------------------------------------
 # Moteur principal
 # -------------------------------------------------------------------------
@@ -260,24 +290,30 @@ class VirtualTreasuryManager:
         # C'est ce qui provoquait l'AssertionError observée en
         # production (remaining_cash < -EPSILON) une fois plusieurs
         # stratégies concernées simultanément par ce seuil.
-        raw_recommended_map: Dict[str, float] = {}
+        # RN-027/RN-028, étape 5 de l'implémentation : le pipeline
+        # travaille désormais dans l'espace des deltas pour la
+        # réconciliation, jamais dans l'espace des budgets absolus —
+        # c'est précisément ce changement d'espace qui permet de
+        # garantir la conservation du signe (I1), impossible à assurer
+        # structurellement quand on redistribue des budgets (cf.
+        # démonstration de l'incident et RN-027).
+        decided_deltas: Dict[str, float] = {}
+        actions: Dict[str, AllocationAction] = {}
         for s in strategies:
             current = s.current_budget
             target = clamped[s.symbol]
             raw_recommended = current + VirtualTreasuryManager.SMOOTHING_FACTOR * (target - current)
             raw_delta = raw_recommended - current
+            actions[s.symbol] = VirtualTreasuryManager._classify_delta_sign(raw_delta)
             if abs(raw_delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
-                raw_recommended_map[s.symbol] = current
+                decided_deltas[s.symbol] = 0.0
             else:
-                raw_recommended_map[s.symbol] = raw_recommended
+                decided_deltas[s.symbol] = raw_delta
 
-        # Réconciliation : on réutilise le même mécanisme itératif que
-        # pour les bornes (déjà corrigé ci-dessus) afin de garantir que
-        # la somme des budgets recommandés, après application du seuil
-        # d'action, retombe exactement sur capital_total — ou échoue
-        # explicitement si c'est structurellement impossible.
-        reconciled = VirtualTreasuryManager._apply_bounds_iterative(
-            raw_recommended_map, goi_dict, min_budget, max_budget, capital_total, strategies
+        current_budgets = {s.symbol: s.current_budget for s in strategies}
+
+        reconciled_deltas = VirtualTreasuryManager._reconcile_deltas(
+            decided_deltas, current_budgets, min_budget, max_budget, capital_total, goi_dict
         )
 
         allocations = []
@@ -285,15 +321,15 @@ class VirtualTreasuryManager:
         for idx, s in enumerate(strategies):
             current = s.current_budget
             target = clamped[s.symbol]
-            recommended = reconciled[s.symbol]
-            delta = recommended - current
+            delta = reconciled_deltas[s.symbol]
+            recommended = current + delta
 
-            if abs(delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
-                action = AllocationAction.HOLD
-            elif delta > 0:
-                action = AllocationAction.INCREASE
-            else:
-                action = AllocationAction.DECREASE
+            # RN-027/RN-028, étape 2 : action n'est plus recalculé ici.
+            # C'est précisément ce recalcul (à partir du budget final,
+            # après réconciliation) qui permettait à une réconciliation
+            # de changer le signe d'une décision déjà prise à l'étape
+            # Deadband — cf. démonstration de l'incident FIL/STX.
+            action = actions[s.symbol]
 
             # Calcul des pourcentages
             current_pct = current / capital_total if capital_total > 0 else 0.0
@@ -476,6 +512,239 @@ class VirtualTreasuryManager:
                 "pas capital_total, ou ajuster les bornes."
             )
         return budgets
+
+    @staticmethod
+    def _reconcile_deltas(
+        decided_deltas: Dict[str, float],
+        current_budgets: Dict[str, float],
+        min_budget: float,
+        max_budget: float,
+        capital_total: float,
+        goi_dict: Dict[str, float],
+    ) -> Dict[str, float]:
+        """
+        Réconcilie des deltas déjà décidés (étape Deadband) pour que
+        leur somme satisfasse exactement la conservation du capital
+        total, sans jamais changer leur signe (RN-027/RN-028).
+
+        SQUELETTE (étape 4 de l'implémentation) : ce corps ne contient
+        que les validations de préconditions. L'algorithme de
+        réconciliation lui-même (étape 6) n'est pas encore implémenté
+        et lève NotImplementedError — conformément au plan
+        d'implémentation, aucune décision algorithmique n'est prise à
+        cette étape.
+
+        Ce contrat est volontairement indépendant de tout algorithme
+        particulier (cf. spécification RN-027/RN-028 v2, §3) : il
+        décrit uniquement ce que le résultat doit satisfaire, jamais
+        comment y parvenir.
+
+        Args:
+            decided_deltas: Deltas déjà décidés à l'étape Deadband
+                (peut contenir des zéros pour les stratégies en HOLD).
+            current_budgets: Budgets actuels par stratégie.
+            min_budget: Borne minimale globale (identique à celle de
+                l'étape Bounds).
+            max_budget: Borne maximale globale (identique à celle de
+                l'étape Bounds).
+            capital_total: Capital total à conserver exactement.
+            goi_dict: GOI par stratégie, disponible pour toute
+                pondération qu'un algorithme de réconciliation
+                choisirait d'appliquer (le choix de pondération n'est
+                pas fixé par ce contrat, cf. Q3 de RN-028).
+
+        Returns:
+            Dict[str, float] : les deltas corrigés (reconciled_deltas)
+            — jamais des budgets absolus.
+
+        Raises:
+            ValueError: si une précondition n'est pas respectée
+                (incohérence des clés, bornes invalides, GOI négatif,
+                capital_total non positif, budget actuel hors bornes).
+            TreasuryReconciliationError: si aucune solution ne peut
+                satisfaire simultanément I1 (conservation du signe),
+                I2 (conservation du capital) et I3 (respect des
+                bornes) — cas d'infaisabilité structurelle. Non encore
+                atteignable à ce stade (NotImplementedError levée
+                avant que ce cas ne puisse se produire).
+        """
+        # --- Préconditions ---
+        symbols = set(current_budgets.keys())
+        if set(decided_deltas.keys()) != symbols or set(goi_dict.keys()) != symbols:
+            raise ValueError(
+                "_reconcile_deltas : decided_deltas, current_budgets et "
+                "goi_dict doivent porter exactement les mêmes clés "
+                f"(current_budgets={sorted(current_budgets.keys())}, "
+                f"decided_deltas={sorted(decided_deltas.keys())}, "
+                f"goi_dict={sorted(goi_dict.keys())})."
+            )
+
+        if capital_total <= 0:
+            raise ValueError(
+                f"_reconcile_deltas : capital_total doit être strictement "
+                f"positif, reçu {capital_total}."
+            )
+
+        if not (0 <= min_budget <= max_budget):
+            raise ValueError(
+                f"_reconcile_deltas : bornes invalides "
+                f"(min_budget={min_budget}, max_budget={max_budget}), "
+                f"attendu 0 ≤ min_budget ≤ max_budget."
+            )
+
+        for sym in symbols:
+            budget = current_budgets[sym]
+            if not (min_budget - VirtualTreasuryManager.EPSILON <= budget
+                    <= max_budget + VirtualTreasuryManager.EPSILON):
+                raise ValueError(
+                    f"_reconcile_deltas : current_budgets['{sym}']={budget} "
+                    f"hors des bornes [{min_budget}, {max_budget}] "
+                    f"(devrait déjà être garanti par l'étape Bounds)."
+                )
+            if goi_dict[sym] < 0:
+                raise ValueError(
+                    f"_reconcile_deltas : goi_dict['{sym}']={goi_dict[sym]} "
+                    f"ne peut pas être négatif."
+                )
+
+        # --- Algorithme de réconciliation (étape 6 de l'implémentation) ---
+        # CHOIX EXPLICITE, documenté ici (Famille C de l'étude
+        # RN-027/RN-028 : redistribution itérative par groupe de même
+        # signe). Ce choix n'engage pas le contrat ci-dessus : toute
+        # autre famille satisfaisant les mêmes préconditions et
+        # postconditions (I1-I6) peut la remplacer sans changer la
+        # signature ni le comportement observable de cette fonction.
+        #
+        # Principe : chaque delta est borné à un intervalle qui ne
+        # permet jamais de changer de signe NI de neutraliser une
+        # décision déjà prise (décision actée : une décision INCREASE
+        # ou DECREASE ne peut jamais être ramenée à un delta nul par la
+        # réconciliation — seule une stratégie déjà en HOLD peut avoir
+        # un delta nul) :
+        #   - si decided_deltas[sym] > 0 (INCREASE) :
+        #       δ ∈ [MIN_DELTA_ACTION, max_budget - current]
+        #   - si decided_deltas[sym] < 0 (DECREASE) :
+        #       δ ∈ [min_budget - current, -MIN_DELTA_ACTION]
+        #   - si decided_deltas[sym] == 0 (HOLD) :
+        #       δ ∈ [0, 0]  (Q1 : reste figé)
+        # Le plancher MIN_DELTA_ACTION est le même seuil qui qualifie
+        # déjà une décision comme INCREASE/DECREASE plutôt que HOLD à
+        # l'étape Deadband : il serait incohérent que la réconciliation
+        # puisse ensuite réduire cette même décision en dessous de ce
+        # seuil, ne serait-ce que l'affaiblir jusqu'à la rendre
+        # équivalente, dans les faits, à un HOLD.
+        #
+        # Si, pour une stratégie donnée, ce plancher minimal n'est même
+        # pas atteignable dans ses bornes propres (lo > hi), c'est une
+        # infaisabilité structurelle immédiate, indépendante de la
+        # convergence globale — détectée avant toute itération.
+        tolerance = VirtualTreasuryManager.EPSILON * max(1.0, capital_total)
+
+        lo: Dict[str, float] = {}
+        hi: Dict[str, float] = {}
+        for sym in symbols:
+            d = decided_deltas[sym]
+            current = current_budgets[sym]
+            if d > 0:
+                lo[sym] = VirtualTreasuryManager.MIN_DELTA_ACTION
+                hi[sym] = max_budget - current
+            elif d < 0:
+                lo[sym] = min_budget - current
+                hi[sym] = -VirtualTreasuryManager.MIN_DELTA_ACTION
+            else:
+                lo[sym] = 0.0
+                hi[sym] = 0.0
+
+            if lo[sym] > hi[sym] + tolerance:
+                raise TreasuryReconciliationError(
+                    f"Réconciliation infaisable : la stratégie '{sym}' "
+                    f"(decided_delta={d:+.2f}) ne dispose pas de la marge "
+                    f"minimale requise (MIN_DELTA_ACTION="
+                    f"{VirtualTreasuryManager.MIN_DELTA_ACTION:.2f}) sans "
+                    f"dépasser ses propres bornes [{min_budget:.2f}, "
+                    f"{max_budget:.2f}] — une décision déjà prise ne peut "
+                    f"jamais être neutralisée par la réconciliation.",
+                    residual=float("nan"),
+                    saturation={sym: {"delta": d, "lo": lo[sym], "hi": hi[sym]}},
+                )
+
+        reconciled: Dict[str, float] = dict(decided_deltas)
+        target_diff = capital_total - sum(current_budgets.values())
+
+        max_iter = 100
+        for _ in range(max_iter):
+            for sym in symbols:
+                reconciled[sym] = max(lo[sym], min(hi[sym], reconciled[sym]))
+
+            residual = target_diff - sum(reconciled.values())
+            if abs(residual) < tolerance:
+                return reconciled
+
+            if residual > 0:
+                group = [sym for sym in symbols if reconciled[sym] < hi[sym] - tolerance]
+            else:
+                group = [sym for sym in symbols if reconciled[sym] > lo[sym] + tolerance]
+
+            if not group:
+                break
+
+            total_goi = sum(goi_dict[sym] for sym in group)
+            if total_goi <= tolerance:
+                for sym in group:
+                    reconciled[sym] += residual / len(group)
+            else:
+                for sym in group:
+                    reconciled[sym] += residual * (goi_dict[sym] / total_goi)
+
+        # Non convergé après max_iter (ou plus aucune stratégie
+        # disponible pour absorber le résidu) : infaisabilité
+        # structurelle, échec explicite (I4) plutôt qu'un résultat
+        # silencieusement incohérent.
+        for sym in symbols:
+            reconciled[sym] = max(lo[sym], min(hi[sym], reconciled[sym]))
+        final_residual = target_diff - sum(reconciled.values())
+        if abs(final_residual) > tolerance:
+            saturation = {
+                sym: {"delta": reconciled[sym], "lo": lo[sym], "hi": hi[sym]}
+                for sym in symbols
+            }
+            raise TreasuryReconciliationError(
+                f"Réconciliation infaisable : résidu non absorbé = {final_residual:.4f} "
+                f"après {max_iter} itérations. Vérifier que les stratégies déjà en "
+                f"INCREASE/DECREASE disposent d'assez de capacité résiduelle pour "
+                f"absorber l'écart, ou revoir les bornes.",
+                residual=final_residual,
+                saturation=saturation,
+            )
+
+        return reconciled
+
+    @staticmethod
+    def _classify_delta_sign(delta: float) -> AllocationAction:
+        """
+        Traduit un delta numérique en décision qualitative
+        (RN-027/RN-028, étape 1 de l'implémentation).
+
+        Fonction pure, sans effet de bord, déterministe. Centralise la
+        seule règle de classification utilisée dans tout le pipeline,
+        pour qu'elle ne soit jamais recalculée différemment à deux
+        endroits (c'est cette duplication implicite — un calcul de
+        "action" à l'étape du lissage, un autre recalcul silencieux à
+        partir du budget final — qui permettait à la réconciliation de
+        changer le signe d'une décision déjà prise, cf. RN-027).
+
+        Args:
+            delta: Écart signé entre un budget cible et le budget
+                actuel (ou toute grandeur de même nature).
+
+        Returns:
+            AllocationAction.HOLD si |delta| < MIN_DELTA_ACTION (zone
+            morte), sinon AllocationAction.INCREASE si delta > 0,
+            AllocationAction.DECREASE si delta < 0.
+        """
+        if abs(delta) < VirtualTreasuryManager.MIN_DELTA_ACTION:
+            return AllocationAction.HOLD
+        return AllocationAction.INCREASE if delta > 0 else AllocationAction.DECREASE
 
     @staticmethod
     def _apply_diminishing_returns(goi: float, current_budget: float, capital_total: float) -> float:
