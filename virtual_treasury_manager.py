@@ -126,6 +126,11 @@ class TreasurySummary:
         mean_delta: Moyenne des deltas (en valeur absolue ? on va mettre la moyenne des deltas signés).
         max_delta: Delta maximum en valeur absolue.
         total_absolute_delta: Somme des valeurs absolues des deltas.
+        remaining_cash: Capital non alloué à ce cycle (RN-029).
+            Toujours ≥ 0 : représente le capital que le lissage n'a
+            volontairement pas encore déployé (convergence progressive
+            sur plusieurs cycles), jamais un manque à combler. Ne doit
+            jamais être interprété comme une anomalie.
     """
     capital_total: float
     free_usdt: float
@@ -136,6 +141,7 @@ class TreasurySummary:
     number_of_strategies: int
     model_version: str = "VTM-v1"
     mean_delta: float = 0.0
+    remaining_cash: float = 0.0
     max_delta: float = 0.0
     total_absolute_delta: float = 0.0
 
@@ -404,6 +410,7 @@ class VirtualTreasuryManager:
             mean_delta=mean_delta,
             max_delta=max_delta,
             total_absolute_delta=total_absolute_delta,
+            remaining_cash=remaining_cash,
         )
 
         return VirtualTreasuryResult(summary=summary, allocations=allocations)
@@ -524,15 +531,48 @@ class VirtualTreasuryManager:
     ) -> Dict[str, float]:
         """
         Réconcilie des deltas déjà décidés (étape Deadband) pour que
-        leur somme satisfasse exactement la conservation du capital
-        total, sans jamais changer leur signe (RN-027/RN-028).
+        leur somme ne dépasse jamais le capital total disponible, sans
+        jamais changer leur signe, les neutraliser, ni les amplifier
+        (RN-027/RN-028/RN-029).
 
-        SQUELETTE (étape 4 de l'implémentation) : ce corps ne contient
-        que les validations de préconditions. L'algorithme de
-        réconciliation lui-même (étape 6) n'est pas encore implémenté
-        et lève NotImplementedError — conformément au plan
-        d'implémentation, aucune décision algorithmique n'est prise à
-        cette étape.
+        Invariants garantis (contrat complet) :
+            I1  — sign(résultat[sym]) == sign(decided_deltas[sym])
+                  pour tout sym où decided_deltas[sym] ≠ 0.
+            I2  — Σ(current_budgets[sym] + résultat[sym]) ≤ capital_total.
+                  Un dépassement (Σ décidé > capital_total) est corrigé
+                  par réduction ; un capital non alloué (Σ décidé <
+                  capital_total) est légitime et n'est jamais comblé
+                  (RN-029).
+            I3  — min_budget ≤ current_budgets[sym] + résultat[sym] ≤ max_budget.
+            I8 (RN-029, NON-AMPLIFICATION) — |résultat[sym]| ≤
+                  |decided_deltas[sym]| pour tout sym, sans exception.
+                  La réconciliation ne peut jamais rendre une décision
+                  plus importante que ce que le lissage a décidé — dans
+                  AUCUNE des deux directions (ni combler un capital non
+                  alloué en l'augmentant, ni "sur-corriger" un
+                  dépassement en l'amplifiant au-delà du strict
+                  nécessaire). Cet invariant est plus fort que I1 : il
+                  ne suffit pas de préserver le signe, il faut préserver
+                  (ou réduire) la magnitude.
+
+        Conséquence directe de I8 : une décision DECREASE n'est JAMAIS
+        modifiée par la réconciliation. La rendre plus négative
+        violerait I8 (amplification) ; la rendre moins négative
+        aggraverait mécaniquement tout dépassement à résorber (ça
+        n'aide jamais). Il n'existe donc aucune direction légitime dans
+        laquelle toucher une DECREASE serait à la fois utile et
+        conforme à I8 — la réconciliation ne considère plus les
+        stratégies DECREASE comme un espace de correction. Seules les
+        stratégies INCREASE peuvent être réduites (jamais en dessous de
+        MIN_DELTA_ACTION, jamais au-delà de leur propre valeur décidée).
+
+        La réduction parmi les stratégies INCREASE est répartie
+        proportionnellement à leur capacité disponible
+        (decided_delta - MIN_DELTA_ACTION), PAS au GOI : le GOI a déjà
+        influencé le calcul du lissage en amont (Target Budgets,
+        Smoothing) ; le réintroduire ici referait de la réconciliation
+        un second moteur de décision économique, contrairement à sa
+        nature de simple contrôle de faisabilité mécanique (RN-029).
 
         Ce contrat est volontairement indépendant de tout algorithme
         particulier (cf. spécification RN-027/RN-028 v2, §3) : il
@@ -547,26 +587,30 @@ class VirtualTreasuryManager:
                 l'étape Bounds).
             max_budget: Borne maximale globale (identique à celle de
                 l'étape Bounds).
-            capital_total: Capital total à conserver exactement.
-            goi_dict: GOI par stratégie, disponible pour toute
-                pondération qu'un algorithme de réconciliation
-                choisirait d'appliquer (le choix de pondération n'est
-                pas fixé par ce contrat, cf. Q3 de RN-028).
+            capital_total: Capital total à ne jamais dépasser.
+            goi_dict: Conservé pour la stabilité de la signature (et la
+                compatibilité des appels existants), mais n'est plus
+                consulté par l'algorithme de réduction (RN-029) — voir
+                ci-dessus. Uniquement validé (non négatif) comme
+                précondition, jamais utilisé pour pondérer quoi que ce
+                soit.
 
         Returns:
             Dict[str, float] : les deltas corrigés (reconciled_deltas)
-            — jamais des budgets absolus.
+            — jamais des budgets absolus. Leur somme peut être
+            strictement inférieure à ce que capital_total permettrait
+            (RN-029) ; c'est un résultat valide, pas une erreur.
 
         Raises:
             ValueError: si une précondition n'est pas respectée
                 (incohérence des clés, bornes invalides, GOI négatif,
                 capital_total non positif, budget actuel hors bornes).
-            TreasuryReconciliationError: si aucune solution ne peut
-                satisfaire simultanément I1 (conservation du signe),
-                I2 (conservation du capital) et I3 (respect des
-                bornes) — cas d'infaisabilité structurelle. Non encore
-                atteignable à ce stade (NotImplementedError levée
-                avant que ce cas ne puisse se produire).
+            TreasuryReconciliationError: si un dépassement (Σ >
+                capital_total) ne peut être résorbé par la seule
+                réduction des stratégies INCREASE sans les neutraliser
+                — cas d'infaisabilité structurelle. Ne concerne jamais
+                le cas du capital non alloué (RN-029), qui n'est pas
+                une infaisabilité.
         """
         # --- Préconditions ---
         symbols = set(current_budgets.keys())
@@ -607,53 +651,60 @@ class VirtualTreasuryManager:
                     f"ne peut pas être négatif."
                 )
 
-        # --- Algorithme de réconciliation (étape 6 de l'implémentation) ---
-        # CHOIX EXPLICITE, documenté ici (Famille C de l'étude
-        # RN-027/RN-028 : redistribution itérative par groupe de même
-        # signe). Ce choix n'engage pas le contrat ci-dessus : toute
-        # autre famille satisfaisant les mêmes préconditions et
-        # postconditions (I1-I6) peut la remplacer sans changer la
-        # signature ni le comportement observable de cette fonction.
+        # --- Algorithme de réconciliation (Famille C, révisée RN-029) ---
+        # CHOIX EXPLICITE, documenté ici. Ce choix n'engage pas le
+        # contrat ci-dessus : toute autre famille satisfaisant les
+        # mêmes préconditions et postconditions (I1-I8) peut la
+        # remplacer sans changer la signature ni le comportement
+        # observable de cette fonction.
         #
-        # Principe : chaque delta est borné à un intervalle qui ne
-        # permet jamais de changer de signe NI de neutraliser une
-        # décision déjà prise (décision actée : une décision INCREASE
-        # ou DECREASE ne peut jamais être ramenée à un delta nul par la
-        # réconciliation — seule une stratégie déjà en HOLD peut avoir
-        # un delta nul) :
-        #   - si decided_deltas[sym] > 0 (INCREASE) :
-        #       δ ∈ [MIN_DELTA_ACTION, max_budget - current]
-        #   - si decided_deltas[sym] < 0 (DECREASE) :
-        #       δ ∈ [min_budget - current, -MIN_DELTA_ACTION]
-        #   - si decided_deltas[sym] == 0 (HOLD) :
-        #       δ ∈ [0, 0]  (Q1 : reste figé)
-        # Le plancher MIN_DELTA_ACTION est le même seuil qui qualifie
-        # déjà une décision comme INCREASE/DECREASE plutôt que HOLD à
-        # l'étape Deadband : il serait incohérent que la réconciliation
-        # puisse ensuite réduire cette même décision en dessous de ce
-        # seuil, ne serait-ce que l'affaiblir jusqu'à la rendre
-        # équivalente, dans les faits, à un HOLD.
-        #
-        # Si, pour une stratégie donnée, ce plancher minimal n'est même
-        # pas atteignable dans ses bornes propres (lo > hi), c'est une
-        # infaisabilité structurelle immédiate, indépendante de la
-        # convergence globale — détectée avant toute itération.
+        # Bornes par stratégie (I8 : jamais au-delà de la décision) :
+        #   - INCREASE (d > 0) : δ ∈ [MIN_DELTA_ACTION, d]
+        #       (réductible vers son plancher, jamais amplifié au-delà de d)
+        #   - DECREASE (d < 0) : δ = d, verrouillé (jamais modifié — voir
+        #       docstring : aucune direction n'est à la fois utile et
+        #       conforme à I8 pour une DECREASE)
+        #   - HOLD (d == 0) : δ = 0, verrouillé (Q1)
         tolerance = VirtualTreasuryManager.EPSILON * max(1.0, capital_total)
 
         lo: Dict[str, float] = {}
         hi: Dict[str, float] = {}
+        capacity: Dict[str, float] = {}
         for sym in symbols:
             d = decided_deltas[sym]
             current = current_budgets[sym]
+
+            # La décision elle-même doit respecter les bornes
+            # budgétaires. Ce n'était auparavant vérifié qu'indirectement
+            # via lo/hi dérivés de min_budget/max_budget ; ce n'est plus
+            # le cas pour DECREASE/HOLD, désormais gelées (I8) — donc
+            # plus aucun mécanisme interne ne pourrait sinon corriger une
+            # décision déjà hors bornes. Doit être vérifié explicitement,
+            # pour tout signe de décision.
+            projected = current + d
+            if not (min_budget - tolerance <= projected <= max_budget + tolerance):
+                raise TreasuryReconciliationError(
+                    f"Réconciliation infaisable : la décision pour '{sym}' "
+                    f"(decided_delta={d:+.2f}) produirait un budget de "
+                    f"{projected:.2f}, hors des bornes [{min_budget:.2f}, "
+                    f"{max_budget:.2f}]. Cette décision ne peut pas être "
+                    f"ajustée par la réconciliation sans l'amplifier ou la "
+                    f"neutraliser (I8) — l'incohérence doit être corrigée "
+                    f"en amont (étape Bounds/Smoothing).",
+                    residual=float("nan"),
+                    saturation={sym: {"delta": d, "lo": min_budget - current, "hi": max_budget - current}},
+                )
+
             if d > 0:
                 lo[sym] = VirtualTreasuryManager.MIN_DELTA_ACTION
-                hi[sym] = max_budget - current
-            elif d < 0:
-                lo[sym] = min_budget - current
-                hi[sym] = -VirtualTreasuryManager.MIN_DELTA_ACTION
+                hi[sym] = d
+                capacity[sym] = d - VirtualTreasuryManager.MIN_DELTA_ACTION
             else:
-                lo[sym] = 0.0
-                hi[sym] = 0.0
+                # DECREASE ou HOLD : verrouillé, aucune marge de
+                # réconciliation (I8).
+                lo[sym] = d
+                hi[sym] = d
+                capacity[sym] = 0.0
 
             if lo[sym] > hi[sym] + tolerance:
                 raise TreasuryReconciliationError(
@@ -661,9 +712,7 @@ class VirtualTreasuryManager:
                     f"(decided_delta={d:+.2f}) ne dispose pas de la marge "
                     f"minimale requise (MIN_DELTA_ACTION="
                     f"{VirtualTreasuryManager.MIN_DELTA_ACTION:.2f}) sans "
-                    f"dépasser ses propres bornes [{min_budget:.2f}, "
-                    f"{max_budget:.2f}] — une décision déjà prise ne peut "
-                    f"jamais être neutralisée par la réconciliation.",
+                    f"être amplifiée au-delà de sa propre décision.",
                     residual=float("nan"),
                     saturation={sym: {"delta": d, "lo": lo[sym], "hi": hi[sym]}},
                 )
@@ -671,48 +720,80 @@ class VirtualTreasuryManager:
         reconciled: Dict[str, float] = dict(decided_deltas)
         target_diff = capital_total - sum(current_budgets.values())
 
+        # Premier clamp aux bornes propres de chaque décision.
+        for sym in symbols:
+            reconciled[sym] = max(lo[sym], min(hi[sym], reconciled[sym]))
+
+        initial_residual = target_diff - sum(reconciled.values())
+
+        # RN-029 : le capital non alloué (résidu positif, la somme des
+        # décisions déjà prises est inférieure au capital disponible)
+        # est un état légitime — c'est le fonctionnement normal d'un
+        # lissage qui ne bouge volontairement qu'une fraction de
+        # l'écart brut par cycle (SMOOTHING_FACTOR). La réconciliation
+        # ne doit jamais combler cet espace en amplifiant des décisions
+        # existantes (I8) : seul un dépassement (résidu négatif) doit
+        # être corrigé. Le reliquat éventuel est retourné tel quel à
+        # l'appelant, qui le reporte en remaining_cash.
+        if initial_residual >= -tolerance:
+            return reconciled
+
         max_iter = 100
         for _ in range(max_iter):
             for sym in symbols:
                 reconciled[sym] = max(lo[sym], min(hi[sym], reconciled[sym]))
 
             residual = target_diff - sum(reconciled.values())
-            if abs(residual) < tolerance:
+            if residual >= -tolerance:
+                # Dépassement résorbé (ou capital non alloué apparu en
+                # cours de route, ce qui reste légitime — RN-029) :
+                # on ne cherche jamais à revenir exactement à l'égalité.
                 return reconciled
 
-            if residual > 0:
-                group = [sym for sym in symbols if reconciled[sym] < hi[sym] - tolerance]
-            else:
-                group = [sym for sym in symbols if reconciled[sym] > lo[sym] + tolerance]
+            # Uniquement les stratégies INCREASE encore réductibles
+            # (I8 : jamais en dessous de MIN_DELTA_ACTION). Les
+            # DECREASE/HOLD ont capacity=0 et lo==hi==reconciled dès le
+            # départ : elles ne peuvent structurellement jamais entrer
+            # dans ce groupe.
+            group = [
+                sym for sym in symbols
+                if decided_deltas[sym] > 0 and reconciled[sym] > lo[sym] + tolerance
+            ]
 
             if not group:
                 break
 
-            total_goi = sum(goi_dict[sym] for sym in group)
-            if total_goi <= tolerance:
+            # Répartition mécanique, proportionnelle à la capacité
+            # disponible de chacun — jamais au GOI (RN-029) : le GOI a
+            # déjà influencé la décision en amont ; la réconciliation
+            # ne réintroduit aucune logique économique.
+            total_capacity = sum(capacity[sym] for sym in group)
+            if total_capacity <= tolerance:
                 for sym in group:
                     reconciled[sym] += residual / len(group)
             else:
                 for sym in group:
-                    reconciled[sym] += residual * (goi_dict[sym] / total_goi)
+                    reconciled[sym] += residual * (capacity[sym] / total_capacity)
 
         # Non convergé après max_iter (ou plus aucune stratégie
-        # disponible pour absorber le résidu) : infaisabilité
-        # structurelle, échec explicite (I4) plutôt qu'un résultat
-        # silencieusement incohérent.
+        # INCREASE disponible pour absorber le dépassement) :
+        # infaisabilité structurelle, échec explicite (I4) plutôt qu'un
+        # résultat silencieusement incohérent.
         for sym in symbols:
             reconciled[sym] = max(lo[sym], min(hi[sym], reconciled[sym]))
         final_residual = target_diff - sum(reconciled.values())
-        if abs(final_residual) > tolerance:
+        if final_residual < -tolerance:
             saturation = {
                 sym: {"delta": reconciled[sym], "lo": lo[sym], "hi": hi[sym]}
                 for sym in symbols
             }
             raise TreasuryReconciliationError(
-                f"Réconciliation infaisable : résidu non absorbé = {final_residual:.4f} "
-                f"après {max_iter} itérations. Vérifier que les stratégies déjà en "
-                f"INCREASE/DECREASE disposent d'assez de capacité résiduelle pour "
-                f"absorber l'écart, ou revoir les bornes.",
+                f"Réconciliation infaisable : dépassement non résorbé = "
+                f"{-final_residual:.4f} après {max_iter} itérations. "
+                f"Les stratégies INCREASE ne disposent pas d'assez de "
+                f"capacité résiduelle pour absorber le dépassement sans "
+                f"amplifier une décision DECREASE (interdit par I8) ; "
+                f"revoir les bornes ou le capital disponible.",
                 residual=final_residual,
                 saturation=saturation,
             )
@@ -784,6 +865,7 @@ class VirtualTreasuryManager:
         print(f"Delta moyen            : {summary.mean_delta:>12.2f}")
         print(f"Delta max (abs)        : {summary.max_delta:>12.2f}")
         print(f"Delta total (abs)      : {summary.total_absolute_delta:>12.2f}")
+        print(f"Capital non alloué     : {summary.remaining_cash:>12.2f} USDT  (RN-029 : reporté aux cycles suivants, pas une anomalie)")
         print("-" * 72)
 
         for a in allocations:
